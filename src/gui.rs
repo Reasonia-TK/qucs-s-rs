@@ -98,6 +98,7 @@ struct App {
     cursor: (i32, i32),
     last_state: String,
     last_state_write: Instant,
+    icons: std::collections::HashMap<String, (Vec<Shape>, [f64; 4])>,
 }
 
 fn mtime(p: &PathBuf) -> Option<SystemTime> {
@@ -141,6 +142,72 @@ fn load_fonts(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
+}
+
+fn paint_shapes_xf(painter: &egui::Painter, shapes: &[Shape], alpha: f32, z: f32, xf: &dyn Fn(f64, f64) -> Pos2) {
+    let col = |c: &Color| Color32::from_rgba_unmultiplied(c.0, c.1, c.2, (c.3 as f32 * alpha) as u8);
+    for s in shapes {
+        match s {
+            Shape::Line { a, b, color, width, dash } => {
+                let pa = xf(a.0, a.1);
+                let pb = xf(b.0, b.1);
+                let st = Stroke::new((*width as f32 * z).max(1.0), col(color));
+                if *dash {
+                    painter.extend(egui::Shape::dashed_line(&[pa, pb], st, 4.0 * z, 3.0 * z));
+                } else {
+                    painter.line_segment([pa, pb], st);
+                }
+            }
+            Shape::Poly { pts, color, width, fill, closed, .. } => {
+                let p: Vec<Pos2> = pts.iter().map(|q| xf(q.0, q.1)).collect();
+                let st = if *width > 0.0 { Stroke::new((*width as f32 * z).max(1.0), col(color)) } else { Stroke::NONE };
+                if let Some(f) = fill {
+                    painter.add(egui::Shape::convex_polygon(p.clone(), col(f), Stroke::NONE));
+                }
+                if *width > 0.0 {
+                    if *closed {
+                        painter.add(egui::Shape::closed_line(p, st));
+                    } else {
+                        painter.add(egui::Shape::line(p, st));
+                    }
+                }
+            }
+            Shape::Ellipse { c, rx, ry, color, width, fill } => {
+                let pc = xf(c.0, c.1);
+                let r = Vec2::new(*rx as f32 * z, *ry as f32 * z);
+                if let Some(f) = fill {
+                    painter.add(egui::Shape::ellipse_filled(pc, r, col(f)));
+                }
+                if *width > 0.0 {
+                    painter.add(egui::Shape::ellipse_stroke(pc, r, Stroke::new((*width as f32 * z).max(1.0), col(color))));
+                }
+            }
+            Shape::Text { pos, text, size, color, bold, angle, bg } => {
+                let fs = (*size as f32 * z).max(1.0);
+                if fs < 3.0 {
+                    continue;
+                }
+                let p = xf(pos.0, pos.1);
+                let galley = painter.layout_no_wrap(text.clone(), FontId::proportional(fs), col(color));
+                if let Some(b) = bg {
+                    painter.rect_filled(Rect::from_min_size(p - Vec2::new(2.0, 0.0), galley.size() + Vec2::new(4.0, 0.0)), 2.0, col(b));
+                }
+                let mut ts = egui::epaint::TextShape::new(p, galley.clone(), col(color));
+                if angle.abs() > 0.01 {
+                    ts = ts.with_angle(angle.to_radians() as f32);
+                }
+                painter.add(ts);
+                if *bold {
+                    // faux bold
+                    let mut t2 = egui::epaint::TextShape::new(p + Vec2::new(0.6, 0.0), galley, col(color));
+                    if angle.abs() > 0.01 {
+                        t2 = t2.with_angle(angle.to_radians() as f32);
+                    }
+                    painter.add(t2);
+                }
+            }
+        }
+    }
 }
 
 impl App {
@@ -204,6 +271,7 @@ impl App {
             cursor: (0, 0),
             last_state: String::new(),
             last_state_write: Instant::now(),
+            icons: Default::default(),
         }
     }
 
@@ -503,70 +571,7 @@ impl App {
     }
 
     fn paint_shapes(&self, painter: &egui::Painter, canvas: Rect, shapes: &[Shape], alpha: f32) {
-        let z = self.zoom;
-        let col = |c: &Color| Color32::from_rgba_unmultiplied(c.0, c.1, c.2, (c.3 as f32 * alpha) as u8);
-        for s in shapes {
-            match s {
-                Shape::Line { a, b, color, width, dash } => {
-                    let pa = self.to_screen(canvas, a.0, a.1);
-                    let pb = self.to_screen(canvas, b.0, b.1);
-                    let st = Stroke::new((*width as f32 * z).max(1.0), col(color));
-                    if *dash {
-                        painter.extend(egui::Shape::dashed_line(&[pa, pb], st, 4.0 * z, 3.0 * z));
-                    } else {
-                        painter.line_segment([pa, pb], st);
-                    }
-                }
-                Shape::Poly { pts, color, width, fill, closed, .. } => {
-                    let p: Vec<Pos2> = pts.iter().map(|q| self.to_screen(canvas, q.0, q.1)).collect();
-                    let st = if *width > 0.0 { Stroke::new((*width as f32 * z).max(1.0), col(color)) } else { Stroke::NONE };
-                    if let Some(f) = fill {
-                        painter.add(egui::Shape::convex_polygon(p.clone(), col(f), Stroke::NONE));
-                    }
-                    if *width > 0.0 {
-                        if *closed {
-                            painter.add(egui::Shape::closed_line(p, st));
-                        } else {
-                            painter.add(egui::Shape::line(p, st));
-                        }
-                    }
-                }
-                Shape::Ellipse { c, rx, ry, color, width, fill } => {
-                    let pc = self.to_screen(canvas, c.0, c.1);
-                    let r = Vec2::new(*rx as f32 * z, *ry as f32 * z);
-                    if let Some(f) = fill {
-                        painter.add(egui::Shape::ellipse_filled(pc, r, col(f)));
-                    }
-                    if *width > 0.0 {
-                        painter.add(egui::Shape::ellipse_stroke(pc, r, Stroke::new((*width as f32 * z).max(1.0), col(color))));
-                    }
-                }
-                Shape::Text { pos, text, size, color, bold, angle, bg } => {
-                    let fs = (*size as f32 * z).max(1.0);
-                    if fs < 3.0 {
-                        continue;
-                    }
-                    let p = self.to_screen(canvas, pos.0, pos.1);
-                    let galley = painter.layout_no_wrap(text.clone(), FontId::proportional(fs), col(color));
-                    if let Some(b) = bg {
-                        painter.rect_filled(Rect::from_min_size(p - Vec2::new(2.0, 0.0), galley.size() + Vec2::new(4.0, 0.0)), 2.0, col(b));
-                    }
-                    let mut ts = egui::epaint::TextShape::new(p, galley.clone(), col(color));
-                    if angle.abs() > 0.01 {
-                        ts = ts.with_angle(angle.to_radians() as f32);
-                    }
-                    painter.add(ts);
-                    if *bold {
-                        // faux bold
-                        let mut t2 = egui::epaint::TextShape::new(p + Vec2::new(0.6, 0.0), galley, col(color));
-                        if angle.abs() > 0.01 {
-                            t2 = t2.with_angle(angle.to_radians() as f32);
-                        }
-                        painter.add(t2);
-                    }
-                }
-            }
-        }
+        paint_shapes_xf(painter, shapes, alpha, self.zoom, &|x, y| self.to_screen(canvas, x, y));
     }
 
     fn paint_grid(&self, painter: &egui::Painter, canvas: Rect) {
@@ -675,6 +680,53 @@ impl App {
         });
     }
 
+    /// Symbol drawing of a component type at the origin (cached).
+    fn icon(&mut self, typ: &str) -> &(Vec<Shape>, [f64; 4]) {
+        self.icons.entry(typ.to_string()).or_insert_with(|| {
+            let mut shapes = Vec::new();
+            let mut bb = [-20.0, -20.0, 20.0, 20.0];
+            if let Ok(c) = library::new_component(typ, "", 0, 0) {
+                let p = library::place(&c, None);
+                for prim in &p.prims {
+                    crate::render::prim_shapes(prim, &mut shapes, None);
+                }
+                bb = p.bbox;
+                for pin in &p.pins {
+                    bb = [bb[0].min(pin.x as f64), bb[1].min(pin.y as f64), bb[2].max(pin.x as f64), bb[3].max(pin.y as f64)];
+                }
+            }
+            (shapes, bb)
+        })
+    }
+
+    /// Palette entry: symbol icon + name, like the Qucs-S component list.
+    fn palette_row(&mut self, ui: &mut egui::Ui, typ: &str, caption: &str, selected: bool) -> egui::Response {
+        const ICON: Vec2 = Vec2::new(46.0, 34.0);
+        let w = ui.available_width();
+        // lay the text out first: long captions wrap, and the row grows to fit them
+        let text_color = ui.visuals().text_color();
+        let galley = ui.painter().layout(format!("{caption}\n{typ}"), FontId::proportional(12.5), text_color, (w - ICON.x - 12.0).max(40.0));
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, ICON.y.max(galley.size().y) + 4.0), Sense::click());
+        if !ui.is_rect_visible(rect) {
+            return resp;
+        }
+        let vis = ui.style().interact_selectable(&resp, selected);
+        if selected || resp.hovered() {
+            ui.painter().rect_filled(rect, 3.0, vis.weak_bg_fill);
+        }
+        let icon_rect = Rect::from_center_size(Pos2::new(rect.min.x + 2.0 + ICON.x / 2.0, rect.center().y), ICON);
+        let (shapes, bb) = self.icon(typ).clone();
+        let (bw, bh) = ((bb[2] - bb[0]).max(1.0), (bb[3] - bb[1]).max(1.0));
+        let scale = ((ICON.x as f64 - 4.0) / bw).min((ICON.y as f64 - 4.0) / bh).min(0.8);
+        let (cx, cy) = ((bb[0] + bb[2]) / 2.0, (bb[1] + bb[3]) / 2.0);
+        let center = icon_rect.center();
+        let painter = ui.painter().with_clip_rect(icon_rect);
+        paint_shapes_xf(&painter, &shapes, 1.0, scale as f32, &|x, y| center + Vec2::new(((x - cx) * scale) as f32, ((y - cy) * scale) as f32));
+        let text_pos = Pos2::new(icon_rect.max.x + 6.0, rect.center().y);
+        ui.painter().galley(text_pos - Vec2::new(0.0, galley.size().y / 2.0), galley, vis.text_color());
+        resp
+    }
+
     fn palette(&mut self, ui: &mut egui::Ui) {
         ui.heading("部品");
         ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("検索 (R, opamp, diode…)"));
@@ -696,7 +748,7 @@ impl App {
                 egui::CollapsingHeader::new(format!("{cat} ({})", items.len())).default_open(!q.is_empty() || cat == "lumped components" || cat == "sources").show(ui, |ui| {
                     for c in items {
                         let selected = self.tool == Tool::Place(c.typ.clone());
-                        if ui.selectable_label(selected, format!("{}  ·  {}", c.caption, c.typ)).on_hover_text(&c.description).clicked() {
+                        if self.palette_row(ui, &c.typ, &c.caption, selected).on_hover_text(&c.description).clicked() {
                             self.tool = Tool::Place(c.typ.clone());
                             self.place_rot = library::new_component(&c.typ, "X", 0, 0).map(|c| c.rotate).unwrap_or(0);
                         }
