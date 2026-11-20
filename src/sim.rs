@@ -492,7 +492,14 @@ pub fn simulate(sch_path: &Path, timeout_s: u64) -> Result<SimResult, String> {
     std::fs::create_dir_all(&workdir).map_err(|e| e.to_string())?;
     let net_path = workdir.join(format!("{stem}.cir"));
     let net = netlist(&sch_path, &net_path)?;
-    let expected = output_files(&net);
+    run_netlist(&net, &workdir, &net_path, timeout_s)
+}
+
+/// Run an ngspice netlist (already written to `net_path` inside `workdir`).
+pub fn run_netlist(net: &str, workdir: &Path, net_path: &Path, timeout_s: u64) -> Result<SimResult, String> {
+    let workdir = workdir.to_path_buf();
+    let net_path = net_path.to_path_buf();
+    let expected = output_files(net);
     if !net.to_ascii_lowercase().contains(".control") || expected.is_empty() {
         return Err("the schematic contains no simulation (add one with add_simulation: tr, ac, dc ...)".into());
     }

@@ -8,6 +8,7 @@ mod edit;
 mod gui;
 mod library;
 mod mcp;
+mod montecarlo;
 mod netlist;
 mod plot;
 mod qlib;

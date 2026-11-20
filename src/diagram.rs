@@ -336,6 +336,12 @@ fn svg_open(s: &mut String, w: f64, h: f64, title: &str) {
 
 /// Flow layout of legend entries; returns (rows height, items with positions).
 fn legend_layout(labels: &[(String, String)], x0: f64, width: f64) -> (f64, Vec<(f64, f64, String, String)>) {
+    // many traces (Monte Carlo, long sweeps): one summary entry instead of a wall of labels
+    if labels.len() > 16 {
+        let first = labels[0].0.split_whitespace().next().unwrap_or("").to_string();
+        let summary = vec![(format!("{first} … {} traces", labels.len()), labels[0].1.clone())];
+        return legend_layout(&summary, x0, width);
+    }
     let mut items = Vec::new();
     let (mut x, mut row) = (x0, 0usize);
     for (lab, col) in labels {

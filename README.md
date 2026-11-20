@@ -59,7 +59,8 @@ cargo build --release
 * 部品パレットは「部品」（220 種の組み込み部品）と「ライブラリ」（Qucs-S 付属の 70 ライブラリ・約 4,200 の実部品）のタブ。どちらもシンボルのアイコン付き
 * 編集: `Ctrl+C / X / V`（Qucs のクリップボード形式なので Qucs-S との間でもコピーできる）、`Ctrl+D` 複製、`Ctrl+A` 全選択、`Y` Y 軸ミラー、`T` テキスト、図形（線・矩形・楕円・矢印）、整列・等間隔配置、ラベルや図形のドラッグ移動、選択肢のあるプロパティはプルダウン、PNG / SVG 書き出し
 * 結果ウィンドウ: 直交（AC は dB＋位相）・極座標・スミスチャート・表。グラフをクリックするとマーカーが付き、各トレースの値を表示。パラメータスイープは全ステップを重ね描き。回路図に埋め込まれた Qucs-S のダイアグラムも枠と系列名を表示
-* ⚙ ツール: フィルタ設計（Butterworth / Chebyshev / Bessel、LP / HP / BP / BS、テスト回路付きで配置）、減衰器設計（π / T / ブリッジ T）、伝送線路計算（マイクロストリップの解析・合成、同軸）、パラメータスイープ、チューニング（スライダーで値を変えると自動で再シミュレーション）
+* タブ: 複数の回路図をタブで開ける（`Ctrl+T` 新規 / `Ctrl+W` 閉じる / `Ctrl+Tab` 切替 / `Ctrl+O` 開く）。エディタは 1 ウィンドウで、2 つ目の起動や MCP の `open_gui` は既存ウィンドウのタブとして開く
+* ⚙ ツール: モンテカルロ解析（R/C/L の許容差、正規/一様分布、測定点の統計と重ね描き。ngspice を並列実行）、フィルタ設計（Butterworth / Chebyshev / Bessel、LP / HP / BP / BS、テスト回路付きで配置）、減衰器設計（π / T / ブリッジ T）、伝送線路計算（マイクロストリップの解析・合成、同軸）、パラメータスイープ、チューニング（スライダーで値を変えると自動で再シミュレーション）
 
 ### MCP サーバー（Claude Code）
 
@@ -95,7 +96,7 @@ Claude Desktop など:
 | 配線 | `connect`（複数ネットを一括、ラベル付与、ピンスワップ、改善パス） `add_wire` `delete_wires` `add_net_label` `reroute` `tidy` |
 | 図形 | `add_painting`（線・矩形・楕円・矢印・テキスト） `delete_paintings` |
 | 見る | `snapshot`（PNG。グリッド＋座標ルーラー、ネット色分けと名前、ピン名、問題マーカー、ハイライト、領域ズーム、`clean` で報告用） `check_layout` |
-| シミュレーション | `add_simulation` `add_parameter_sweep` `get_netlist` `run_simulation` `get_results`（指定点の補間値・表） `plot_results`（直交・極座標・スミス・表、マーカー値を数値でも返す） |
+| シミュレーション | `add_simulation` `add_parameter_sweep` `run_monte_carlo`（部品値のばらつき、統計・歩留まり・重ね描き・ヒストグラム） `get_netlist` `run_simulation` `get_results`（指定点の補間値・表） `plot_results`（直交・極座標・スミス・表、マーカー値を数値でも返す） |
 | 設計ツール | `design_filter`（LC フィルタ合成→配置・配線、テスト回路付き） `design_attenuator` `calc_transmission_line`（マイクロストリップ / 同軸） |
 | エディタ連携 | `open_gui`（ユーザーにライブ表示） `get_gui_state`（ユーザーが選択中の部品・表示範囲） |
 
@@ -130,6 +131,7 @@ src/
   edit.rs       クリップボード、複製、整列、図形
   rftools.rs    フィルタ・減衰器・伝送線路の計算
   synth.rs      計算結果を回路図に配置・配線（テスト回路付き）
+  montecarlo.rs モンテカルロ解析（ネットリストの値を揺らして ngspice を並列実行）
   plot.rs       数値の表記
 data/
   components.json  プロパティ・ピン（qucs-s から実測）
@@ -151,6 +153,7 @@ python tools\extract_symbols.py ..\qucs_s_src_ref\qucs_s data\components.json da
 cargo test                                # パーサ往復、ピン位置、接続解析、ルーター
 python tests\e2e_mcp.py                   # MCP クライアントとして回路作成〜シミュレーションまで
 python tests\live_sync.py                 # エディタを開いたまま MCP で編集し、追従を確認
+python tests\e2e_mc.py                   # モンテカルロ解析
 python tests\e2e_features.py             # ライブラリ部品・フィルタ合成・マーカー・スイープ・編集ツール
 ```
 

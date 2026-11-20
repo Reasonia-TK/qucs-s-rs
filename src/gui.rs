@@ -31,6 +31,19 @@ fn detach_own_console() {
 }
 
 pub fn run(path: Option<PathBuf>) {
+    // one editor window: hand the file to a running editor (opens as a tab)
+    if let Some(p) = &path {
+        let alive = std::fs::metadata(crate::mcp::gui_heartbeat_path()).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).map(|d| d.as_secs_f64() < 3.0).unwrap_or(false);
+        if alive && std::env::var_os("QUCS_RS_NEW_WINDOW").is_none() {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(crate::mcp::gui_open_request_path()) {
+                let abs = plain_path(&p.canonicalize().unwrap_or_else(|_| p.clone()));
+                if writeln!(f, "{}", abs.display()).is_ok() {
+                    return;
+                }
+            }
+        }
+    }
     detach_own_console();
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 780.0]).with_maximized(true).with_title("Qucs-S RS"),
@@ -98,7 +111,7 @@ struct App {
     status: String,
     issues: Vec<Issue>,
     show_issue_panel: bool,
-    sim_rx: Option<Receiver<Result<SimResult, String>>>,
+    sim_rx: Option<(u64, Receiver<Result<SimResult, String>>)>,
     sim: Option<SimResult>,
     show_sim: bool,
     plot_analysis: usize,
@@ -119,6 +132,87 @@ struct App {
     plot_area: Option<(f64, f64, f64, f64, f64, f64, bool)>,
     plot_px: (f32, f32),
     tools: Tools,
+    // ---- tabs: the active document lives in the fields above, the others here
+    tab_id: u64,
+    next_tab_id: u64,
+    tabs: Vec<Option<TabState>>,
+    active: usize,
+    last_heartbeat: Instant,
+    mc: McWindow,
+}
+
+/// Per-document state of an inactive tab.
+struct TabState {
+    tab_id: u64,
+    doc: Doc,
+    conn: Connectivity,
+    scene: Scene,
+    gen: u64,
+    offset: Vec2,
+    zoom: f32,
+    need_fit: bool,
+    sel: Vec<usize>,
+    sel_wires: Vec<usize>,
+    sel_paint: Vec<usize>,
+    disk_mtime: Option<SystemTime>,
+    external_change: bool,
+    issues: Vec<Issue>,
+    sim: Option<SimResult>,
+    show_sim: bool,
+    plot_analysis: usize,
+    plot_vectors: Vec<String>,
+    markers: Vec<f64>,
+}
+
+impl TabState {
+    fn new(doc: Doc, id: u64) -> TabState {
+        let conn = doc.conn();
+        let disk_mtime = doc.path.as_ref().and_then(mtime);
+        TabState {
+            tab_id: id,
+            doc,
+            conn,
+            scene: Scene::default(),
+            gen: 1,
+            offset: Vec2::ZERO,
+            zoom: 1.5,
+            need_fit: true,
+            sel: vec![],
+            sel_wires: vec![],
+            sel_paint: vec![],
+            disk_mtime,
+            external_change: false,
+            issues: vec![],
+            sim: None,
+            show_sim: false,
+            plot_analysis: 0,
+            plot_vectors: vec![],
+            markers: vec![],
+        }
+    }
+}
+
+/// Monte Carlo window.
+struct McWindow {
+    open: bool,
+    runs: usize,
+    tol_r: f64,
+    tol_c: f64,
+    tol_l: f64,
+    gauss: bool,
+    analysis: String,
+    vector: String,
+    at: String,
+    rx: Option<Receiver<Result<(serde_json::Value, Option<(u32, u32, Vec<u8>)>, Option<(u32, u32, Vec<u8>)>), String>>>,
+    summary: Option<serde_json::Value>,
+    tex: Vec<egui::TextureHandle>,
+    error: String,
+}
+
+impl Default for McWindow {
+    fn default() -> Self {
+        McWindow { open: false, runs: 50, tol_r: 5.0, tol_c: 10.0, tol_l: 10.0, gauss: true, analysis: String::new(), vector: String::new(), at: String::new(), rx: None, summary: None, tex: vec![], error: String::new() }
+    }
 }
 
 /// State of the analysis / design tool windows.
@@ -256,6 +350,12 @@ fn load_fonts(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
+}
+
+/// `canonicalize` on Windows yields `\?\C:\...`; Qucs-S and users expect plain paths.
+fn plain_path(p: &std::path::Path) -> PathBuf {
+    let s = p.display().to_string();
+    PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s))
 }
 
 /// Component for a palette key: a type name, or "Lib:<library>/<component>".
@@ -406,6 +506,12 @@ impl App {
             plot_area: None,
             plot_px: (0.0, 0.0),
             tools: Tools::default(),
+            tab_id: 1,
+            next_tab_id: 2,
+            tabs: vec![None],
+            active: 0,
+            last_heartbeat: Instant::now() - std::time::Duration::from_secs(10),
+            mc: McWindow::default(),
         }
     }
 
@@ -485,6 +591,7 @@ impl App {
             "cursor": [self.cursor.0, self.cursor.1],
             "tool": match &self.tool { Tool::Select => "select".to_string(), Tool::Wire => "wire".into(), Tool::AutoWire => "autowire".into(), Tool::Label => "label".into(), Tool::Place(t) => format!("place:{t}"), Tool::Paint(k) => format!("paint:{k}") },
             "unsaved_changes": self.doc.dirty,
+            "open_tabs": (0..self.tabs.len()).map(|i| if i == self.active { self.doc.path.clone() } else { self.tabs[i].as_ref().and_then(|t| t.doc.path.clone()) }.map(|p| p.display().to_string())).collect::<Vec<_>>(),
         })
         .to_string();
         if st != self.last_state {
@@ -751,32 +858,348 @@ impl App {
         std::thread::spawn(move || {
             let _ = tx.send(sim::simulate(&p, 300));
         });
-        self.sim_rx = Some(rx);
+        self.sim_rx = Some((self.tab_id, rx));
         self.status = "シミュレーション実行中…".into();
     }
 
     fn open_dialog(&mut self) {
-        if let Some(p) = rfd::FileDialog::new().add_filter("Qucs schematic", &["sch"]).pick_file() {
-            match Doc::open(&p) {
-                Ok(d) => {
-                    self.doc = d;
-                    self.disk_mtime = mtime(&p);
-                    self.need_fit = true;
-                    self.sel.clear();
-                    self.sel_wires.clear();
-                    self.sim = None;
-                    self.changed_no_save();
-                }
-                Err(e) => self.status = e,
+        if let Some(files) = rfd::FileDialog::new().add_filter("Qucs schematic", &["sch"]).pick_files() {
+            for p in files {
+                self.open_path(&p);
             }
         }
     }
 
-    fn changed_no_save(&mut self) {
-        let a = self.auto_save;
-        self.auto_save = false;
-        self.changed();
-        self.auto_save = a;
+    /// Open a file in a tab (switches to it when it is already open).
+    fn open_path(&mut self, p: &std::path::Path) {
+        let canon = |x: &std::path::Path| x.canonicalize().unwrap_or_else(|_| x.to_path_buf());
+        let want = canon(p);
+        if self.doc.path.as_deref().map(canon) == Some(want.clone()) {
+            return;
+        }
+        if let Some(i) = self.tabs.iter().position(|t| t.as_ref().and_then(|t| t.doc.path.as_deref().map(canon)) == Some(want.clone())) {
+            self.switch_tab(i);
+            return;
+        }
+        match Doc::open(p) {
+            Ok(d) => {
+                // reuse an empty, untitled tab
+                if self.doc.path.is_none() && self.doc.sch.components.is_empty() && self.doc.sch.wires.is_empty() {
+                    let id = self.tab_id;
+                    self.install_tab(TabState::new(d, id));
+                } else {
+                    self.new_tab(d);
+                }
+                self.status = format!("開きました: {}", p.display());
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    // ------------------------------------------------------------------ tabs
+
+    fn stash_tab(&mut self) -> TabState {
+        TabState {
+            tab_id: self.tab_id,
+            doc: std::mem::replace(&mut self.doc, Doc::new(Schematic::new_empty("untitled"), None)),
+            conn: std::mem::replace(&mut self.conn, Connectivity::build(&Schematic::default(), None)),
+            scene: std::mem::take(&mut self.scene),
+            gen: self.gen,
+            offset: self.offset,
+            zoom: self.zoom,
+            need_fit: self.need_fit,
+            sel: std::mem::take(&mut self.sel),
+            sel_wires: std::mem::take(&mut self.sel_wires),
+            sel_paint: std::mem::take(&mut self.sel_paint),
+            disk_mtime: self.disk_mtime,
+            external_change: self.external_change,
+            issues: std::mem::take(&mut self.issues),
+            sim: self.sim.take(),
+            show_sim: self.show_sim,
+            plot_analysis: self.plot_analysis,
+            plot_vectors: std::mem::take(&mut self.plot_vectors),
+            markers: std::mem::take(&mut self.markers),
+        }
+    }
+
+    fn install_tab(&mut self, t: TabState) {
+        self.tab_id = t.tab_id;
+        self.doc = t.doc;
+        self.conn = t.conn;
+        self.scene = t.scene;
+        self.gen = t.gen + 1; // force a scene rebuild
+        self.offset = t.offset;
+        self.zoom = t.zoom;
+        self.need_fit = t.need_fit;
+        self.sel = t.sel;
+        self.sel_wires = t.sel_wires;
+        self.sel_paint = t.sel_paint;
+        self.disk_mtime = t.disk_mtime;
+        self.external_change = t.external_change;
+        self.issues = t.issues;
+        self.sim = t.sim;
+        self.show_sim = t.show_sim;
+        self.plot_analysis = t.plot_analysis;
+        self.plot_vectors = t.plot_vectors;
+        self.markers = t.markers;
+        // transient interaction state belongs to no tab
+        self.drag = None;
+        self.grab = None;
+        self.box_start = None;
+        self.wire_pts.clear();
+        self.autowire_first = None;
+        self.paint_start = None;
+        self.prop_for = None;
+        self.plot_tex = None;
+        self.plot_dirty = true;
+        self.marker_out = serde_json::Value::Null;
+        self.plot_area = None;
+        self.last_poll = Instant::now() - std::time::Duration::from_secs(1);
+        if self.show_issues {
+            self.issues = check::check(&self.doc.sch, &self.conn).issues;
+        }
+    }
+
+    fn new_tab(&mut self, d: Doc) {
+        let cur = self.stash_tab();
+        self.tabs[self.active] = Some(cur);
+        self.tabs.push(None);
+        self.active = self.tabs.len() - 1;
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.install_tab(TabState::new(d, id));
+    }
+
+    fn switch_tab(&mut self, i: usize) {
+        if i == self.active || i >= self.tabs.len() {
+            return;
+        }
+        let cur = self.stash_tab();
+        self.tabs[self.active] = Some(cur);
+        let t = self.tabs[i].take().expect("inactive tab state");
+        self.active = i;
+        self.install_tab(t);
+        self.poll_disk();
+    }
+
+    fn close_tab(&mut self, i: usize) {
+        if i >= self.tabs.len() {
+            return;
+        }
+        if self.tabs.len() == 1 {
+            let id = self.tab_id;
+            self.install_tab(TabState::new(Doc::new(Schematic::new_empty("untitled"), None), id));
+            return;
+        }
+        if i == self.active {
+            let next = if i + 1 < self.tabs.len() { i + 1 } else { i - 1 };
+            let t = self.tabs[next].take().expect("inactive tab state");
+            self.tabs.remove(i);
+            self.active = if next > i { next - 1 } else { next };
+            self.install_tab(t);
+        } else {
+            self.tabs.remove(i);
+            if i < self.active {
+                self.active -= 1;
+            }
+        }
+    }
+
+    fn tab_title(&self, i: usize) -> String {
+        let (path, dirty) = if i == self.active {
+            (self.doc.path.clone(), self.doc.dirty && !self.auto_save)
+        } else {
+            match &self.tabs[i] {
+                Some(t) => (t.doc.path.clone(), t.doc.dirty && !self.auto_save),
+                None => (None, false),
+            }
+        };
+        let name = path.as_ref().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "無題".into());
+        format!("{name}{}", if dirty { " *" } else { "" })
+    }
+
+    fn tab_bar(&mut self, ui: &mut egui::Ui) {
+        let mut switch = None;
+        let mut close = None;
+        ui.horizontal_wrapped(|ui| {
+            for i in 0..self.tabs.len() {
+                let title = self.tab_title(i);
+                let full = if i == self.active { self.doc.path.clone() } else { self.tabs[i].as_ref().and_then(|t| t.doc.path.clone()) };
+                let r = ui.selectable_label(i == self.active, &title).on_hover_text(full.map(|p| p.display().to_string()).unwrap_or_default());
+                if r.clicked() {
+                    switch = Some(i);
+                }
+                if r.middle_clicked() {
+                    close = Some(i);
+                }
+                if ui.small_button("✖").on_hover_text("タブを閉じる (Ctrl+W)").clicked() {
+                    close = Some(i);
+                }
+                ui.separator();
+            }
+            if ui.small_button("＋").on_hover_text("新しいタブ (Ctrl+T)").clicked() {
+                self.new_tab(Doc::new(Schematic::new_empty("untitled"), None));
+            }
+        });
+        if let Some(i) = close {
+            self.close_tab(i);
+        } else if let Some(i) = switch {
+            self.switch_tab(i);
+        }
+    }
+
+    // ------------------------------------------------------------------ single instance
+
+    /// Tell MCP servers that this editor is alive (they then send files here instead of starting another window).
+    fn heartbeat(&mut self) {
+        if self.last_heartbeat.elapsed().as_millis() < 1000 {
+            return;
+        }
+        self.last_heartbeat = Instant::now();
+        let p = crate::mcp::gui_heartbeat_path();
+        let _ = std::fs::create_dir_all(p.parent().unwrap());
+        let _ = std::fs::write(&p, std::process::id().to_string());
+    }
+
+    fn poll_open_requests(&mut self) {
+        let p = crate::mcp::gui_open_request_path();
+        let Ok(text) = std::fs::read_to_string(&p) else { return };
+        let _ = std::fs::remove_file(&p);
+        for line in text.lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+            self.open_path(std::path::Path::new(line));
+        }
+    }
+
+    // ------------------------------------------------------------------ Monte Carlo
+
+    fn mc_window(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.mc.rx {
+            if let Ok(r) = rx.try_recv() {
+                self.mc.rx = None;
+                match r {
+                    Ok((summary, ov, hist)) => {
+                        self.mc.tex.clear();
+                        for (k, img) in [ov, hist].into_iter().flatten().enumerate() {
+                            let ci = egui::ColorImage::from_rgba_premultiplied([img.0 as usize, img.1 as usize], &img.2);
+                            self.mc.tex.push(ctx.load_texture(format!("mc{k}"), ci, egui::TextureOptions::LINEAR));
+                        }
+                        self.status = format!("モンテカルロ完了: {} 回", summary["successful"]);
+                        self.mc.summary = Some(summary);
+                        self.mc.error.clear();
+                    }
+                    Err(e) => self.mc.error = e,
+                }
+            }
+        }
+        if !self.mc.open {
+            return;
+        }
+        let mut open = true;
+        let mut start = false;
+        egui::Window::new("モンテカルロ解析").open(&mut open).default_size([900.0, 700.0]).show(ctx, |ui| {
+            let m = &mut self.mc;
+            ui.small("回路の解析（AC・過渡など）を、部品値をばらつかせて何度も実行します。1 回目は公称値です。");
+            egui::Grid::new("mcg").num_columns(4).show(ui, |ui| {
+                ui.label("回数");
+                ui.add(egui::DragValue::new(&mut m.runs).range(2..=2000));
+                ui.label("分布");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut m.gauss, true, "正規 (許容差=3σ)");
+                    ui.radio_value(&mut m.gauss, false, "一様");
+                });
+                ui.end_row();
+                ui.label("許容差 R [%]");
+                ui.add(egui::DragValue::new(&mut m.tol_r).range(0.0..=50.0).speed(0.1));
+                ui.label("C [%]");
+                ui.add(egui::DragValue::new(&mut m.tol_c).range(0.0..=50.0).speed(0.1));
+                ui.end_row();
+                ui.label("L [%]");
+                ui.add(egui::DragValue::new(&mut m.tol_l).range(0.0..=50.0).speed(0.1));
+                ui.label("解析");
+                ui.add(egui::TextEdit::singleline(&mut m.analysis).hint_text("ac1 / tr1（空=最初）").desired_width(120.0));
+                ui.end_row();
+                ui.label("ベクトル");
+                ui.add(egui::TextEdit::singleline(&mut m.vector).hint_text("v(out)").desired_width(120.0));
+                ui.label("測定点 (x)");
+                ui.add(egui::TextEdit::singleline(&mut m.at).hint_text("10 MHz, 20 MHz").desired_width(160.0));
+                ui.end_row();
+            });
+            ui.horizontal(|ui| {
+                if m.rx.is_some() {
+                    ui.spinner();
+                    ui.label("実行中…");
+                } else if ui.button("▶ 実行").clicked() {
+                    start = true;
+                }
+            });
+            if !m.error.is_empty() {
+                ui.colored_label(Color32::RED, &m.error);
+            }
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                if let Some(s) = &m.summary {
+                    ui.label(format!("成功 {} / {} 回   分布: {}", s["successful"], s["runs"], s["distribution"].as_str().unwrap_or("")));
+                    if let Some(y) = s.get("yield").filter(|y| !y.is_null()) {
+                        ui.label(format!("歩留まり: {}%", y["yield_percent"]));
+                    }
+                    egui::Grid::new("mcstats").striped(true).show(ui, |ui| {
+                        for h in ["ベクトル", "x", "公称", "平均", "σ", "最小", "最大"] {
+                            ui.strong(h);
+                        }
+                        ui.end_row();
+                        for mm in s["measurements"].as_array().cloned().unwrap_or_default() {
+                            let st = &mm["stats"];
+                            let f = |v: &serde_json::Value| v.as_f64().map(|x| format!("{x:.4}")).unwrap_or_default();
+                            ui.label(format!("{} {}", mm["vector"].as_str().unwrap_or(""), mm["unit"].as_str().unwrap_or("")));
+                            ui.label(mm["at"].as_f64().map(crate::plot::eng).unwrap_or_else(|| "終点".into()));
+                            ui.label(f(&mm["nominal"]));
+                            ui.label(f(&st["mean"]));
+                            ui.label(f(&st["std"]));
+                            ui.label(f(&st["min"]));
+                            ui.label(f(&st["max"]));
+                            ui.end_row();
+                        }
+                    });
+                }
+                for t in &m.tex {
+                    let w = ui.available_width();
+                    let sz = t.size_vec2();
+                    ui.image((t.id(), sz * (w / sz.x).min(1.0)));
+                }
+            });
+        });
+        self.mc.open = open;
+        if start {
+            let Some(p) = self.doc.path.clone() else {
+                self.mc.error = "先に保存してください".into();
+                return;
+            };
+            if let Err(e) = self.doc.save() {
+                self.mc.error = e;
+                return;
+            }
+            self.disk_mtime = mtime(&p);
+            let m = &self.mc;
+            let at: Vec<serde_json::Value> = m.at.split(',').filter_map(|x| crate::rftools::parse_value(x.trim())).map(|x| serde_json::json!(x)).collect();
+            let args = serde_json::json!({
+                "runs": m.runs, "distribution": if m.gauss { "gauss" } else { "uniform" },
+                "tolerances": {"R": m.tol_r, "C": m.tol_c, "L": m.tol_l},
+                "analysis": if m.analysis.trim().is_empty() { serde_json::Value::Null } else { serde_json::json!(m.analysis.trim()) },
+                "vectors": if m.vector.trim().is_empty() { serde_json::json!([]) } else { serde_json::json!([m.vector.trim()]) },
+                "at": at,
+            });
+            let (tx, rx) = channel();
+            std::thread::spawn(move || {
+                let spec = crate::montecarlo::spec_from_json(&args);
+                let r = crate::montecarlo::run(&p, &spec).map(|res| {
+                    let ov = crate::montecarlo::overlay_svg(&res, &spec, 200).ok().and_then(|s| crate::render::svg_to_rgba(&s).ok());
+                    let first = res.summary["measurements"].as_array().and_then(|m| m.first()).cloned();
+                    let hist = first.and_then(|m| crate::montecarlo::histogram_svg(&res, &spec, m["vector"].as_str().unwrap_or(""), m["at"].as_f64())).and_then(|s| crate::render::svg_to_rgba(&s).ok());
+                    (res.summary, ov, hist)
+                });
+                let _ = tx.send(r);
+            });
+            self.mc.rx = Some(rx);
+        }
     }
 
     fn save_as(&mut self) {
@@ -1364,6 +1787,10 @@ impl App {
                     self.tools.s_sim = self.doc.sch.components.iter().find(|c| c.typ.starts_with('.') && c.typ != ".SW").map(|c| c.name.clone()).unwrap_or_default();
                 }
                 self.tools.sweep_open = true;
+                ui.close();
+            }
+            if ui.button("モンテカルロ解析…").clicked() {
+                self.mc.open = true;
                 ui.close();
             }
             if ui.button("チューニング…").clicked() {
@@ -2100,6 +2527,24 @@ impl App {
                 _ => {}
             }
         }
+        if ctrl && pressed(egui::Key::T) {
+            self.new_tab(Doc::new(Schematic::new_empty("untitled"), None));
+            return;
+        }
+        if ctrl && pressed(egui::Key::W) {
+            self.close_tab(self.active);
+            return;
+        }
+        if ctrl && pressed(egui::Key::Tab) {
+            let n = self.tabs.len();
+            let shift = ctx.input(|i| i.modifiers.shift);
+            self.switch_tab(if shift { (self.active + n - 1) % n } else { (self.active + 1) % n });
+            return;
+        }
+        if ctrl && pressed(egui::Key::O) {
+            self.open_dialog();
+            return;
+        }
         if ctrl && pressed(egui::Key::D) {
             self.duplicate_selection();
             return;
@@ -2167,9 +2612,22 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_disk();
-        if let Some(rx) = &self.sim_rx {
+        self.poll_open_requests();
+        self.heartbeat();
+        if let Some((tid, rx)) = &self.sim_rx {
             if let Ok(r) = rx.try_recv() {
+                let tid = *tid;
                 self.sim_rx = None;
+                if tid != self.tab_id {
+                    // finished for a tab that is not shown: keep it there
+                    if let Some(t) = self.tabs.iter_mut().flatten().find(|t| t.tab_id == tid) {
+                        if let Ok(res) = r {
+                            t.sim = Some(res);
+                            t.show_sim = true;
+                        }
+                    }
+                    return;
+                }
                 match r {
                     Ok(res) => {
                         self.status = format!("シミュレーション完了 ({:.2} s): {}", res.elapsed, res.plots.iter().map(|p| p.name.clone()).collect::<Vec<_>>().join(", "));
@@ -2192,9 +2650,10 @@ impl eframe::App for App {
 
         let screen = ctx.content_rect();
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui, screen));
+        egui::TopBottomPanel::top("tabs").show(ctx, |ui| self.tab_bar(ui));
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if self.sim_rx.is_some() {
+                if self.sim_rx.is_some() || self.mc.rx.is_some() {
                     ui.spinner();
                 }
                 ui.label(&self.status);
@@ -2251,6 +2710,7 @@ impl eframe::App for App {
         });
         self.sim_window(ctx);
         self.tool_windows(ctx);
+        self.mc_window(ctx);
         if let Some((pos, mut text, editing)) = self.text_prompt.take() {
             let mut done = false;
             let mut cancel = false;
@@ -2312,5 +2772,12 @@ impl eframe::App for App {
         }
         // keep polling the file even when idle
         ctx.request_repaint_after(std::time::Duration::from_millis(350));
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        // no longer accepting files: let the next launch open its own window
+        let _ = std::fs::remove_file(crate::mcp::gui_heartbeat_path());
     }
 }
