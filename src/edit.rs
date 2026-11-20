@@ -3,7 +3,7 @@
 
 use crate::doc::{snap, unique_name, Doc};
 use crate::library::{text_size, LINE_H};
-use crate::schematic::{painting_tokens, quote, Component, Schematic};
+use crate::schematic::{painting_tokens, quote, Component, Schematic, Wire};
 use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
@@ -245,6 +245,161 @@ pub fn wire_label_at(doc: &Doc, x: f64, y: f64) -> Option<usize> {
     })
 }
 
+/// Drag wire `wi` of `wires` by (dx, dy) and return the new wire list.
+///
+/// A horizontal wire only moves up/down and a vertical one only left/right
+/// (a point or diagonal wire moves freely). At each end, wires meeting it at a
+/// right angle stretch along; an end held by a pin, a collinear wire or a
+/// non-following wire stays put and a stub wire keeps it connected. A stub that
+/// runs along an existing wire of the same junction is merged into it, so no
+/// overlapping or mid-wire connections are left behind.
+pub fn drag_wire(wires: &[Wire], pins: &HashSet<(i32, i32)>, wi: usize, dx: i32, dy: i32) -> Vec<Wire> {
+    let mut out = wires.to_vec();
+    let Some(w) = wires.get(wi) else { return out };
+    let (dx, dy) = if w.is_point() {
+        (dx, dy)
+    } else if w.is_horizontal() {
+        (0, dy)
+    } else if w.is_vertical() {
+        (dx, 0)
+    } else {
+        (dx, dy)
+    };
+    if (dx, dy) == (0, 0) {
+        return out;
+    }
+    let mv = |p: (i32, i32)| (p.0 + dx, p.1 + dy);
+    // a neighbour can follow when moving its end keeps it horizontal/vertical
+    let follows = |n: &Wire| n.is_point() || (n.is_vertical() && dx == 0) || (n.is_horizontal() && dy == 0);
+    let ends: Vec<(i32, i32)> = if w.is_point() { vec![w.p1()] } else { vec![w.p1(), w.p2()] };
+    let mut stubs: Vec<((i32, i32), (i32, i32))> = Vec::new();
+    for e in ends {
+        let nbrs: Vec<usize> = (0..wires.len()).filter(|&j| j != wi && (wires[j].p1() == e || wires[j].p2() == e)).collect();
+        let mid_of_other = wires.iter().enumerate().any(|(j, o)| j != wi && o.p1() != e && o.p2() != e && on_segment(o, e));
+        let held = pins.contains(&e) || mid_of_other || nbrs.iter().any(|&j| !follows(&wires[j]));
+        if held {
+            stubs.push((e, mv(e)));
+            continue;
+        }
+        for j in nbrs {
+            let n = &wires[j];
+            let (a, b) = (if n.p1() == e { mv(n.p1()) } else { n.p1() }, if n.p2() == e { mv(n.p2()) } else { n.p2() });
+            out[j] = rebuilt(n, a, b, if n.is_point() { (dx, dy) } else { (0, 0) });
+        }
+    }
+    out[wi] = rebuilt(w, mv(w.p1()), mv(w.p2()), (dx, dy));
+    for (a, b) in stubs {
+        // a stub along an unlabelled wire that leaves the same junction: replace
+        // both by the segments between their end points (removes the overlap)
+        let along = (0..out.len()).find(|&j| {
+            let o = &out[j];
+            j != wi && o.label.is_empty() && !o.is_point() && (o.p1() == a || o.p2() == a) && collinear(o, a, b) && {
+                let far = if o.p1() == a { o.p2() } else { o.p1() };
+                (far.0 - a.0).signum() == (b.0 - a.0).signum() && (far.1 - a.1).signum() == (b.1 - a.1).signum()
+            }
+        });
+        match along {
+            Some(j) => {
+                let far = if out[j].p1() == a { out[j].p2() } else { out[j].p1() };
+                let (near, farthest) = if (far.0 - a.0).abs() + (far.1 - a.1).abs() < (b.0 - a.0).abs() + (b.1 - a.1).abs() { (far, b) } else { (b, far) };
+                out[j] = Wire::new(a.0, a.1, near.0, near.1);
+                out.push(Wire::new(near.0, near.1, farthest.0, farthest.1));
+            }
+            None => out.push(Wire::new(a.0, a.1, b.0, b.1)),
+        }
+    }
+    out
+}
+
+/// Move a selection (parts, wires, paintings) of `sch` by (dx, dy) as one block.
+///
+/// `pins` are the component pins `(component, x, y)` before the move. Unselected
+/// wires attached to a moved point (a pin of a moved part, or any point of a moved
+/// wire) follow: with both ends attached they move along, with one end they
+/// stretch, or turn into an L that keeps the direction at the fixed end when a
+/// plain stretch would make them diagonal. Wires are not merged here
+/// (`doc::normalize_wires` does that after the drag).
+pub fn move_group(sch: &mut Schematic, pins: &[(usize, i32, i32)], comps: &[usize], wires: &[usize], paints: &[usize], dx: i32, dy: i32) {
+    if (dx, dy) == (0, 0) {
+        return;
+    }
+    let comp_set: HashSet<usize> = comps.iter().copied().collect();
+    let wire_set: HashSet<usize> = wires.iter().copied().collect();
+    let moved_pins: HashSet<(i32, i32)> = pins.iter().filter(|p| comp_set.contains(&p.0)).map(|p| (p.1, p.2)).collect();
+    let fixed_pins: HashSet<(i32, i32)> = pins.iter().filter(|p| !comp_set.contains(&p.0)).map(|p| (p.1, p.2)).collect();
+    let orig = sch.wires.clone();
+    let on_moved_wire = |p: (i32, i32)| wires.iter().filter_map(|&i| orig.get(i)).any(|w| on_segment(w, p) || w.p1() == p || w.p2() == p);
+    // a point follows the block unless a part that stays put holds it
+    let moves = |p: (i32, i32)| (moved_pins.contains(&p) || on_moved_wire(p)) && !fixed_pins.contains(&p);
+    let mv = |p: (i32, i32)| (p.0 + dx, p.1 + dy);
+    for &i in comps {
+        if let Some(c) = sch.components.get_mut(i) {
+            c.x += dx;
+            c.y += dy;
+        }
+    }
+    for &i in paints {
+        if let Some(p) = sch.paintings.get_mut(i) {
+            *p = translate_painting(p, dx, dy);
+        }
+    }
+    let mut extra = Vec::new();
+    for (i, w) in orig.iter().enumerate() {
+        if wire_set.contains(&i) {
+            sch.wires[i] = rebuilt(w, mv(w.p1()), mv(w.p2()), (dx, dy));
+            continue;
+        }
+        let (ma, mb) = (moves(w.p1()), moves(w.p2()));
+        if w.is_point() || (ma && mb) {
+            if ma || mb {
+                sch.wires[i] = rebuilt(w, mv(w.p1()), mv(w.p2()), (dx, dy));
+            }
+            continue;
+        }
+        if !ma && !mb {
+            continue;
+        }
+        let (f, e) = if ma { (w.p2(), w.p1()) } else { (w.p1(), w.p2()) };
+        let ne = mv(e);
+        let corner = if w.is_horizontal() && ne.1 != f.1 {
+            Some((ne.0, f.1))
+        } else if w.is_vertical() && ne.0 != f.0 {
+            Some((f.0, ne.1))
+        } else {
+            None
+        };
+        match corner {
+            None => sch.wires[i] = rebuilt(w, f, ne, (0, 0)),
+            Some(c) => {
+                sch.wires[i] = rebuilt(w, f, c, (0, 0));
+                extra.push(Wire::new(c.0, c.1, ne.0, ne.1));
+            }
+        }
+    }
+    sch.wires.extend(extra);
+}
+
+/// `w` with new end points; its label moves by `shift` and keeps its anchor.
+fn rebuilt(w: &Wire, a: (i32, i32), b: (i32, i32), shift: (i32, i32)) -> Wire {
+    let mut n = Wire::new(a.0, a.1, b.0, b.1);
+    n.extra = w.extra.clone();
+    if !w.label.is_empty() {
+        let (ax, ay) = w.label_anchor();
+        n.set_label(&w.label, w.lx + shift.0, w.ly + shift.1, (ax + shift.0, ay + shift.1));
+    }
+    n
+}
+
+/// Point strictly inside or at the ends of an axis-parallel wire.
+fn on_segment(w: &Wire, p: (i32, i32)) -> bool {
+    (w.is_horizontal() && p.1 == w.y1 && p.0 >= w.x1.min(w.x2) && p.0 <= w.x1.max(w.x2))
+        || (w.is_vertical() && p.0 == w.x1 && p.1 >= w.y1.min(w.y2) && p.1 <= w.y1.max(w.y2))
+}
+
+fn collinear(w: &Wire, a: (i32, i32), b: (i32, i32)) -> bool {
+    (w.is_horizontal() && a.1 == b.1 && a.1 == w.y1) || (w.is_vertical() && a.0 == b.0 && a.0 == w.x1)
+}
+
 /// Which component text block is under the point.
 pub fn comp_label_at(doc: &Doc, x: f64, y: f64) -> Option<usize> {
     let conn = doc.conn();
@@ -252,4 +407,95 @@ pub fn comp_label_at(doc: &Doc, x: f64, y: f64) -> Option<usize> {
         let b = p.label_bbox?;
         (x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3]).then_some(i)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn segs(ws: &[Wire]) -> Vec<(i32, i32, i32, i32)> {
+        let mut v: Vec<_> = ws.iter().filter(|w| !w.is_point()).map(|w| (w.x1, w.y1, w.x2, w.y2)).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn drag_wire_stretches_perpendicular_neighbours() {
+        // U shape: two verticals joined by a horizontal at the bottom
+        let ws = vec![Wire::new(0, 0, 0, 100), Wire::new(0, 100, 100, 100), Wire::new(100, 0, 100, 100)];
+        let out = drag_wire(&ws, &HashSet::new(), 1, 7, 40);
+        assert_eq!(segs(&out), vec![(0, 0, 0, 140), (0, 140, 100, 140), (100, 0, 100, 140)]);
+    }
+
+    #[test]
+    fn drag_wire_adds_stub_at_pin() {
+        // horizontal wire between two pins
+        let ws = vec![Wire::new(0, 0, 100, 0)];
+        let pins: HashSet<_> = [(0, 0), (100, 0)].into_iter().collect();
+        let out = drag_wire(&ws, &pins, 0, 0, 30);
+        assert_eq!(segs(&out), vec![(0, 0, 0, 30), (0, 30, 100, 30), (100, 0, 100, 30)]);
+    }
+
+    #[test]
+    fn drag_wire_merges_stub_into_wire_along_the_move() {
+        // horizontal ends on a pin that also has a wire going down: the stub
+        // would overlap it, so that wire is split at the new corner instead
+        let ws = vec![Wire::new(0, 0, 100, 0), Wire::new(0, 0, 0, 100)];
+        let pins: HashSet<_> = [(0, 0)].into_iter().collect();
+        let out = drag_wire(&ws, &pins, 0, 0, 30);
+        assert_eq!(segs(&out), vec![(0, 0, 0, 30), (0, 30, 0, 100), (0, 30, 100, 30)]);
+    }
+
+    #[test]
+    fn drag_wire_keeps_collinear_neighbour_connected() {
+        let ws = vec![Wire::new(0, 0, 100, 0), Wire::new(100, 0, 200, 0)];
+        let out = drag_wire(&ws, &HashSet::new(), 1, 0, -20);
+        assert_eq!(segs(&out), vec![(0, 0, 100, 0), (100, -20, 100, 0), (100, -20, 200, -20)]);
+    }
+
+    #[test]
+    fn drag_wire_moves_label_with_it() {
+        let mut w = Wire::new(0, 0, 100, 0);
+        w.set_label("n1", 40, -20, (50, 0));
+        let out = drag_wire(&[w], &HashSet::new(), 0, 0, 30);
+        assert_eq!((out[0].lx, out[0].ly, out[0].label_anchor()), (40, 10, (50, 30)));
+    }
+
+    fn sch_with(comps: &[(i32, i32)], wires: Vec<Wire>) -> Schematic {
+        let mut s = Schematic::default();
+        for (k, &(x, y)) in comps.iter().enumerate() {
+            s.components.push(Component::parse(&format!("R R{k} 1 {x} {y} 0 0 0 1 \"1k\" 1")).unwrap());
+        }
+        s.wires = wires;
+        s
+    }
+
+    #[test]
+    fn move_group_moves_block_and_stretches_attached_wires() {
+        // part 0 (pins at 0,0 and 0,60) with a wire to part 1 (pin at 200,0);
+        // part 0 and a wire hanging below it are selected and moved right by 50
+        let mut s = sch_with(&[(0, 30), (200, 30)], vec![Wire::new(0, 0, 200, 0), Wire::new(0, 60, 0, 100)]);
+        let pins = [(0, 0, 0), (0, 0, 60), (1, 200, 0)];
+        move_group(&mut s, &pins, &[0], &[1], &[], 50, 0);
+        assert_eq!((s.components[0].x, s.components[1].x), (50, 200));
+        assert_eq!(segs(&s.wires), vec![(50, 0, 200, 0), (50, 60, 50, 100)]);
+    }
+
+    #[test]
+    fn move_group_bends_wires_that_would_go_diagonal() {
+        let mut s = sch_with(&[(0, 30), (200, 30)], vec![Wire::new(0, 0, 200, 0)]);
+        let pins = [(0, 0, 0), (1, 200, 0)];
+        move_group(&mut s, &pins, &[0], &[], &[], 0, 40);
+        // the wire stays where it is and a jog reaches the moved pin
+        assert_eq!(segs(&s.wires), vec![(0, 0, 0, 40), (0, 0, 200, 0)]);
+    }
+
+    #[test]
+    fn move_group_keeps_pins_of_parts_left_behind() {
+        // a wire ends on a pin of a part that is not selected: that end stays
+        let mut s = sch_with(&[(0, 30), (200, 30)], vec![Wire::new(0, 0, 200, 0)]);
+        let pins = [(0, 0, 0), (1, 200, 0)];
+        move_group(&mut s, &pins, &[], &[0], &[], 0, -20);
+        assert_eq!(segs(&s.wires), vec![(0, -20, 200, -20)]);
+    }
 }

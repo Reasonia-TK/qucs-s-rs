@@ -68,6 +68,11 @@ enum Grab {
     WireLabel { wire: usize, orig: (i32, i32), start: (f64, f64) },
     CompLabel { comp: usize, orig: (i32, i32), start: (f64, f64) },
     Paintings { orig: Vec<(usize, String)>, start: (i32, i32), moved: (i32, i32) },
+    /// a wire segment: `orig` is the wire list before the drag, `pins` the pin points
+    Wire { wire: usize, orig: Vec<crate::schematic::Wire>, pins: std::collections::HashSet<(i32, i32)>, start: (i32, i32), moved: (i32, i32) },
+    /// a mixed selection (parts + wires + paintings) moved as one block; `orig` is the
+    /// schematic before the drag, `pins` the component pins `(component, x, y)` then
+    Group { orig: Box<Schematic>, pins: Vec<(usize, i32, i32)>, comps: Vec<usize>, wires: Vec<usize>, paints: Vec<usize>, start: (i32, i32), moved: (i32, i32) },
 }
 
 struct Drag {
@@ -652,6 +657,20 @@ impl App {
             }
         }
         best.map(|b| b.1)
+    }
+
+    /// Start dragging the whole selection (parts, wires and paintings) as one block.
+    fn start_group(&mut self, px: f64, py: f64) {
+        let pins = self.conn.pins.iter().map(|p| (p.comp, p.x, p.y)).collect();
+        self.grab = Some(Grab::Group {
+            orig: Box::new(self.doc.sch.clone()),
+            pins,
+            comps: self.sel.clone(),
+            wires: self.sel_wires.clone(),
+            paints: self.sel_paint.clone(),
+            start: (px.round() as i32, py.round() as i32),
+            moved: (0, 0),
+        });
     }
 
     fn wire_at(&self, x: f64, y: f64) -> Option<usize> {
@@ -2362,6 +2381,34 @@ impl App {
 
     fn select_tool(&mut self, resp: &egui::Response, canvas: Rect, painter: &egui::Painter, pointer: Option<(f64, f64)>) {
         let primary_down = resp.ctx.input(|i| i.pointer.primary_down());
+        // a wire under the pointer (and no part) can be dragged: show the direction it moves
+        let wire_dir = match &self.grab {
+            Some(Grab::Wire { wire, orig, .. }) => orig.get(*wire).cloned(),
+            Some(Grab::Group { .. }) => Some(crate::schematic::Wire::new(0, 0, 0, 0)),
+            Some(_) => None,
+            None if self.drag.is_none() && self.box_start.is_none() => pointer
+                .filter(|&(px, py)| self.comp_at(px, py).is_none() && crate::edit::wire_label_at(&self.doc, px, py).is_none())
+                // (matches the drag-start order: wire label, wire, component text, part)
+                .and_then(|(px, py)| self.wire_at(px, py))
+                .map(|wi| {
+                    if self.sel_wires.contains(&wi) && self.sel.len() + self.sel_wires.len() + self.sel_paint.len() > 1 {
+                        // part of a selection: the whole block moves freely
+                        crate::schematic::Wire::new(0, 0, 0, 0)
+                    } else {
+                        self.doc.sch.wires[wi].clone()
+                    }
+                }),
+            None => None,
+        };
+        if let Some(w) = wire_dir {
+            resp.ctx.set_cursor_icon(if w.is_point() || (!w.is_horizontal() && !w.is_vertical()) {
+                egui::CursorIcon::Move
+            } else if w.is_horizontal() {
+                egui::CursorIcon::ResizeVertical
+            } else {
+                egui::CursorIcon::ResizeHorizontal
+            });
+        }
         if resp.double_clicked() {
             if let Some((px, py)) = pointer {
                 if let Some(pi) = crate::edit::painting_at(&self.doc, px, py) {
@@ -2387,6 +2434,17 @@ impl App {
                 if let Some(wi) = crate::edit::wire_label_at(&self.doc, px, py) {
                     let w = &self.doc.sch.wires[wi];
                     self.grab = Some(Grab::WireLabel { wire: wi, orig: (w.lx, w.ly), start: (px, py) });
+                } else if let Some(wi) = self.wire_at(px, py).filter(|_| self.comp_at(px, py).is_none()) {
+                    // a wire wins over a component text block lying across it
+                    if self.sel_wires.contains(&wi) && self.sel.len() + self.sel_wires.len() + self.sel_paint.len() > 1 {
+                        self.start_group(px, py);
+                        return;
+                    }
+                    self.sel.clear();
+                    self.sel_paint.clear();
+                    self.sel_wires = vec![wi];
+                    let pins = self.conn.pins.iter().map(|p| (p.x, p.y)).collect();
+                    self.grab = Some(Grab::Wire { wire: wi, orig: self.doc.sch.wires.clone(), pins, start: (px.round() as i32, py.round() as i32), moved: (0, 0) });
                 } else if let Some(ci) = crate::edit::comp_label_at(&self.doc, px, py).filter(|ci| self.sel.contains(ci) || self.comp_at(px, py).is_none()) {
                     let c = &self.doc.sch.components[ci];
                     self.grab = Some(Grab::CompLabel { comp: ci, orig: (c.tx, c.ty), start: (px, py) });
@@ -2394,12 +2452,19 @@ impl App {
                     if !self.sel.contains(&ci) {
                         self.sel = vec![ci];
                         self.sel_wires.clear();
+                        self.sel_paint.clear();
+                    } else if !self.sel_wires.is_empty() || !self.sel_paint.is_empty() {
+                        self.start_group(px, py);
+                        return;
                     }
                     let orig = self.sel.iter().map(|&i| (i, self.doc.sch.components[i].x, self.doc.sch.components[i].y)).collect();
                     self.drag = Some(Drag { start: (px.round() as i32, py.round() as i32), orig, moved: false });
                 } else if let Some(pi) = crate::edit::painting_at(&self.doc, px, py) {
                     if !self.sel_paint.contains(&pi) {
                         self.sel_paint = vec![pi];
+                    } else if !self.sel.is_empty() || !self.sel_wires.is_empty() {
+                        self.start_group(px, py);
+                        return;
                     }
                     let orig = self.sel_paint.iter().map(|&k| (k, self.doc.sch.paintings[k].clone())).collect();
                     self.grab = Some(Grab::Paintings { orig, start: (px.round() as i32, py.round() as i32), moved: (0, 0) });
@@ -2448,6 +2513,22 @@ impl App {
                             }
                         }
                     }
+                    Grab::Wire { wire, orig, pins, start, moved } => {
+                        let d = (snap(px.round() as i32 - start.0), snap(py.round() as i32 - start.1));
+                        if d != *moved {
+                            *moved = d;
+                            self.doc.sch.wires = crate::edit::drag_wire(orig, pins, *wire, d.0, d.1);
+                        }
+                    }
+                    Grab::Group { orig, pins, comps, wires, paints, start, moved } => {
+                        let d = (snap(px.round() as i32 - start.0), snap(py.round() as i32 - start.1));
+                        if d != *moved {
+                            *moved = d;
+                            let mut s = (**orig).clone();
+                            crate::edit::move_group(&mut s, pins, comps, wires, paints, d.0, d.1);
+                            self.doc.sch = s;
+                        }
+                    }
                 }
                 self.conn = self.doc.conn();
                 self.gen += 1;
@@ -2478,9 +2559,28 @@ impl App {
                             self.doc.sch.paintings[*k] = line.clone();
                         }
                     }
+                    Grab::Wire { orig, .. } => self.doc.sch.wires = orig.clone(),
+                    Grab::Group { orig, .. } => self.doc.sch = (**orig).clone(),
                 }
                 self.doc.checkpoint();
                 self.doc.sch = snapshot;
+                if let Grab::Wire { wire, pins, .. } = &g {
+                    // merge the stretched / split wires and keep the dragged one selected
+                    let moved = self.doc.sch.wires[*wire].clone();
+                    self.doc.sch.wires = crate::doc::normalize_wires(std::mem::take(&mut self.doc.sch.wires), pins);
+                    let on = |w: &crate::schematic::Wire, p: (i32, i32)| {
+                        (w.x1.min(w.x2)..=w.x1.max(w.x2)).contains(&p.0) && (w.y1.min(w.y2)..=w.y1.max(w.y2)).contains(&p.1)
+                    };
+                    self.sel_wires = self.doc.sch.wires.iter().position(|w| on(w, moved.p1()) && on(w, moved.p2())).into_iter().collect();
+                }
+                if let Grab::Group { wires, moved: d, .. } = &g {
+                    // merge stretched wires; keep the moved wires selected
+                    let moved: Vec<crate::schematic::Wire> = wires.iter().filter_map(|&i| self.doc.sch.wires.get(i).cloned()).collect();
+                    let pins = self.doc.conn().pins.iter().map(|p| (p.x, p.y)).collect();
+                    self.doc.sch.wires = crate::doc::normalize_wires(std::mem::take(&mut self.doc.sch.wires), &pins);
+                    self.sel_wires = wire_cover(&self.doc.sch.wires, &moved);
+                    self.status = format!("{} 個を移動 ({}, {})", self.sel.len() + moved.len() + self.sel_paint.len(), d.0, d.1);
+                }
                 self.changed();
             }
             if let Some(d) = self.drag.take() {
@@ -2848,4 +2948,10 @@ impl Drop for App {
         // no longer accepting files: let the next launch open its own window
         let _ = std::fs::remove_file(crate::mcp::gui_heartbeat_path());
     }
+}
+
+/// Indices of the wires in `wires` that lie on one of the `moved` wires (after merging).
+fn wire_cover(wires: &[crate::schematic::Wire], moved: &[crate::schematic::Wire]) -> Vec<usize> {
+    let inside = |w: &crate::schematic::Wire, p: (i32, i32)| (w.x1.min(w.x2)..=w.x1.max(w.x2)).contains(&p.0) && (w.y1.min(w.y2)..=w.y1.max(w.y2)).contains(&p.1);
+    wires.iter().enumerate().filter(|(_, w)| moved.iter().any(|m| inside(m, w.p1()) && inside(m, w.p2()) || inside(w, m.p1()) && inside(w, m.p2()))).map(|(i, _)| i).collect()
 }
