@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "qucs-s-rs": {
-      "command": "target/release/qucs-s-rs.exe",
-      "args": ["mcp"]
+      "command": "cmd",
+      "args": ["/c", "tools\\qucs-s-rs-mcp.cmd"]
     }
   }
 }

@@ -64,11 +64,25 @@ cargo build --release
 
 ### MCP サーバー（Claude Code）
 
-このフォルダで Claude Code を開くと `.mcp.json` により `qucs-s-rs` サーバーが使えます（先に release ビルドが必要）。
-別のプロジェクトから使う場合:
+サーバーは `tools\qucs-s-rs-mcp.cmd` から起動します。このランチャーは release ビルドを
+`%LOCALAPPDATA%\qucs-s-rs\mcp-bin\` にコピーしてから実行するので、サーバーが動いていても
+`target\release\qucs-s-rs.exe` はロックされず、`cargo build --release` でいつでも上書きできます
+（新しいビルドは次に起動したサーバーから使われます。使われなくなったコピーは次回起動時に削除）。
+
+このフォルダの `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "qucs-s-rs": { "command": "cmd", "args": ["/c", "tools\\qucs-s-rs-mcp.cmd"] }
+  }
+}
+```
+
+別のプロジェクトから使う場合（先に release ビルドが必要。Git Bash では `/c` がパスに変換されるので PowerShell で実行）:
 
 ```powershell
-claude mcp add qucs-s-rs -- C:\workspace\20261120_Qucs-S-Rust\target\release\qucs-s-rs.exe mcp
+claude mcp add -s user qucs-s-rs -- cmd /c C:\workspace\20261120_Qucs-S-Rust\tools\qucs-s-rs-mcp.cmd
 ```
 
 Claude Desktop など:
@@ -77,8 +91,8 @@ Claude Desktop など:
 {
   "mcpServers": {
     "qucs-s-rs": {
-      "command": "C:\\workspace\\20261120_Qucs-S-Rust\\target\\release\\qucs-s-rs.exe",
-      "args": ["mcp"],
+      "command": "cmd",
+      "args": ["/c", "C:\\workspace\\20261120_Qucs-S-Rust\\tools\\qucs-s-rs-mcp.cmd"],
       "env": { "QUCS_MCP_WORKDIR": "C:\\path\\to\\schematics" }
     }
   }
