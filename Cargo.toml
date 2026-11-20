@@ -1,0 +1,28 @@
+[package]
+name = "qucs-s-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight Rust fork of the Qucs-S schematic editor with a built-in MCP server for AI agents"
+license = "GPL-2.0-or-later"
+
+[[bin]]
+name = "qucs-s-rs"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.33"
+resvg = { version = "0.50", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+base64 = "0.23"
+rfd = "0.18"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 2
