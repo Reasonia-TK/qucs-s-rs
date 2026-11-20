@@ -936,7 +936,10 @@ impl App {
         self.doc = t.doc;
         self.conn = t.conn;
         self.scene = t.scene;
-        self.gen = t.gen + 1; // force a scene rebuild
+        self.gen = t.gen + 1;
+        // the cached scene key belongs to the previous tab and its gen can equal ours
+        // (every new tab starts at gen 2), so invalidate it: gen is never 0
+        self.scene_key.0 = 0;
         self.offset = t.offset;
         self.zoom = t.zoom;
         self.need_fit = t.need_fit;
