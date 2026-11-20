@@ -8,7 +8,8 @@ use crate::netlist::Connectivity;
 use crate::render::{build_scene, Color, Overlay, Scene, Shape};
 use crate::schematic::Schematic;
 use crate::sim::{self, SimResult};
-use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
+use crate::theme::{self, Palette};
+use egui::{Align2, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Instant, SystemTime};
@@ -118,6 +119,9 @@ struct App {
     plot_vectors: Vec<String>,
     plot_tex: Option<egui::TextureHandle>,
     plot_dirty: bool,
+    theme_pref: egui::ThemePreference,
+    /// Theme the scene and plot textures were built for.
+    tex_theme: egui::Theme,
     prop_for: Option<usize>,
     prop_buf: Vec<String>,
     name_buf: String,
@@ -206,12 +210,13 @@ struct McWindow {
     rx: Option<Receiver<Result<(serde_json::Value, Option<(u32, u32, Vec<u8>)>, Option<(u32, u32, Vec<u8>)>), String>>>,
     summary: Option<serde_json::Value>,
     tex: Vec<egui::TextureHandle>,
+    raw: Vec<(u32, u32, Vec<u8>)>,
     error: String,
 }
 
 impl Default for McWindow {
     fn default() -> Self {
-        McWindow { open: false, runs: 50, tol_r: 5.0, tol_c: 10.0, tol_l: 10.0, gauss: true, analysis: String::new(), vector: String::new(), at: String::new(), rx: None, summary: None, tex: vec![], error: String::new() }
+        McWindow { open: false, runs: 50, tol_r: 5.0, tol_c: 10.0, tol_l: 10.0, gauss: true, analysis: String::new(), vector: String::new(), at: String::new(), rx: None, summary: None, tex: vec![], raw: vec![], error: String::new() }
     }
 }
 
@@ -367,7 +372,8 @@ fn spec_component(spec: &str, x: i32, y: i32) -> Result<crate::schematic::Compon
 }
 
 fn paint_shapes_xf(painter: &egui::Painter, shapes: &[Shape], alpha: f32, z: f32, xf: &dyn Fn(f64, f64) -> Pos2) {
-    let col = |c: &Color| Color32::from_rgba_unmultiplied(c.0, c.1, c.2, (c.3 as f32 * alpha) as u8);
+    let pal: &Palette = theme::pal(painter.ctx());
+    let col = |c: &Color| pal.map(c, alpha);
     for s in shapes {
         match s {
             Shape::Line { a, b, color, width, dash } => {
@@ -437,7 +443,8 @@ impl App {
         if std::env::var_os("QUCS_RS_NO_FONTS").is_none() {
             load_fonts(&cc.egui_ctx);
         }
-        cc.egui_ctx.set_visuals(egui::Visuals::light());
+        let theme_pref = theme::load_pref();
+        theme::install(&cc.egui_ctx, theme_pref);
         let mut status = String::new();
         let doc = match &path {
             Some(p) if p.exists() => Doc::open(p).unwrap_or_else(|e| {
@@ -492,6 +499,8 @@ impl App {
             plot_vectors: vec![],
             plot_tex: None,
             plot_dirty: false,
+            theme_pref,
+            tex_theme: cc.egui_ctx.theme(),
             prop_for: None,
             prop_buf: vec![],
             name_buf: String::new(),
@@ -1072,17 +1081,28 @@ impl App {
 
     // ------------------------------------------------------------------ Monte Carlo
 
+    fn mc_textures(&mut self, ctx: &egui::Context) {
+        let pal = theme::pal(ctx);
+        self.mc.tex = self
+            .mc
+            .raw
+            .iter()
+            .enumerate()
+            .map(|(k, img)| {
+                let ci = egui::ColorImage::from_rgba_premultiplied([img.0 as usize, img.1 as usize], &pal.map_image(&img.2));
+                ctx.load_texture(format!("mc{k}"), ci, egui::TextureOptions::LINEAR)
+            })
+            .collect();
+    }
+
     fn mc_window(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.mc.rx {
             if let Ok(r) = rx.try_recv() {
                 self.mc.rx = None;
                 match r {
                     Ok((summary, ov, hist)) => {
-                        self.mc.tex.clear();
-                        for (k, img) in [ov, hist].into_iter().flatten().enumerate() {
-                            let ci = egui::ColorImage::from_rgba_premultiplied([img.0 as usize, img.1 as usize], &img.2);
-                            self.mc.tex.push(ctx.load_texture(format!("mc{k}"), ci, egui::TextureOptions::LINEAR));
-                        }
+                        self.mc.raw = [ov, hist].into_iter().flatten().collect();
+                        self.mc_textures(ctx);
                         self.status = format!("モンテカルロ完了: {} 回", summary["successful"]);
                         self.mc.summary = Some(summary);
                         self.mc.error.clear();
@@ -1133,7 +1153,7 @@ impl App {
                 }
             });
             if !m.error.is_empty() {
-                ui.colored_label(Color32::RED, &m.error);
+                ui.colored_label(ui.visuals().error_fg_color, &m.error);
             }
             egui::ScrollArea::vertical().show(ui, |ui| {
                 if let Some(s) = &m.summary {
@@ -1233,10 +1253,18 @@ impl App {
             } else {
                 vec![]
             },
+            wire_color: Some(theme::to_color(self.pal().wire)),
             ..Default::default()
         };
         self.scene = build_scene(&self.doc.sch, &self.conn, &ov);
         self.scene_key = key;
+    }
+
+    fn pal(&self) -> &'static Palette {
+        match self.tex_theme {
+            egui::Theme::Dark => &theme::DARK,
+            egui::Theme::Light => &theme::LIGHT,
+        }
     }
 
     fn paint_shapes(&self, painter: &egui::Painter, canvas: Rect, shapes: &[Shape], alpha: f32) {
@@ -1254,7 +1282,7 @@ impl App {
         if (gx1 - gx0) * (gy1 - gy0) > 40_000 {
             return;
         }
-        let c = Color32::from_gray(185);
+        let c = self.pal().grid;
         for gx in gx0..=gx1 {
             for gy in gy0..=gy1 {
                 let p = self.to_screen(canvas, gx as f64 * step, gy as f64 * step);
@@ -1264,6 +1292,30 @@ impl App {
     }
 
     // ------------------------------------------------------------------ UI parts
+
+    fn theme_menu(&mut self, ui: &mut egui::Ui) {
+        let cur = match self.theme_pref {
+            egui::ThemePreference::Dark => "☾ ダーク",
+            egui::ThemePreference::Light => "☀ ライト",
+            egui::ThemePreference::System => "◐ システム",
+        };
+        ui.menu_button(cur, |ui| {
+            for (p, label) in [
+                (egui::ThemePreference::Light, "☀ ライト（アイボリー）"),
+                (egui::ThemePreference::Dark, "☾ ダーク（オブシディアン・ゴールド）"),
+                (egui::ThemePreference::System, "◐ システム設定に合わせる"),
+            ] {
+                if ui.selectable_label(self.theme_pref == p, label).clicked() {
+                    self.theme_pref = p;
+                    ui.ctx().set_theme(p);
+                    theme::save_pref(p);
+                    ui.close();
+                }
+            }
+        })
+        .response
+        .on_hover_text("表示テーマ");
+    }
 
     fn toolbar(&mut self, ui: &mut egui::Ui, canvas_hint: Rect) {
         ui.horizontal_wrapped(|ui| {
@@ -1329,7 +1381,9 @@ impl App {
                 self.show_issues = true;
                 self.gen += 1;
             }
-            if ui.button("▶ シミュレーション").clicked() {
+            let pal = self.pal();
+            let run = egui::Button::new(egui::RichText::new("▶ シミュレーション").color(pal.on_accent)).fill(pal.accent).stroke(Stroke::NONE);
+            if ui.add(run).clicked() {
                 self.run_sim();
             }
             ui.menu_button("✏ 図形", |ui| {
@@ -1628,7 +1682,7 @@ impl App {
                 return;
             };
             if !r.errors.is_empty() {
-                ui.colored_label(Color32::RED, r.errors.join("\n"));
+                ui.colored_label(ui.visuals().error_fg_color, r.errors.join("\n"));
             }
             if r.plots.is_empty() {
                 return;
@@ -1700,7 +1754,7 @@ impl App {
                         self.marker_out = out.markers.clone();
                         self.plot_area = out.plot_area;
                         if let Ok((w, h, rgba)) = crate::render::svg_to_rgba(&out.svg) {
-                            let img = egui::ColorImage::from_rgba_premultiplied([w as usize, h as usize], &rgba);
+                            let img = egui::ColorImage::from_rgba_premultiplied([w as usize, h as usize], &theme::pal(ctx).map_image(&rgba));
                             self.plot_px = (w as f32, h as f32);
                             self.plot_tex = Some(ctx.load_texture("plot", img, egui::TextureOptions::LINEAR));
                         }
@@ -2091,7 +2145,7 @@ impl App {
     fn canvas(&mut self, ui: &mut egui::Ui) {
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let canvas = resp.rect;
-        painter.rect_filled(canvas, 0.0, Color32::WHITE);
+        painter.rect_filled(canvas, 0.0, self.pal().canvas);
         self.rebuild_scene();
         if self.need_fit {
             self.fit(canvas);
@@ -2135,7 +2189,7 @@ impl App {
                         let pl = library::place(&c, None);
                         let mut ghost = Vec::new();
                         for p in &pl.prims {
-                            crate::render::prim_shapes(p, &mut ghost, Some(Color(0, 0, 160, 255)));
+                            crate::render::prim_shapes(p, &mut ghost, Some(theme::to_color(self.pal().accent)));
                         }
                         self.paint_shapes(&painter, canvas, &ghost, 0.5);
                     }
@@ -2169,11 +2223,11 @@ impl App {
                     let cur = (snap(px.round() as i32), snap(py.round() as i32));
                     if let Some(&last) = self.wire_pts.last() {
                         let mid = (cur.0, last.1);
-                        let s = Stroke::new(2.0, Color32::from_rgb(0, 120, 255));
+                        let s = Stroke::new(2.0, self.pal().accent);
                         painter.line_segment([self.to_screen(canvas, last.0 as f64, last.1 as f64), self.to_screen(canvas, mid.0 as f64, mid.1 as f64)], s);
                         painter.line_segment([self.to_screen(canvas, mid.0 as f64, mid.1 as f64), self.to_screen(canvas, cur.0 as f64, cur.1 as f64)], s);
                     }
-                    painter.circle_stroke(self.to_screen(canvas, cur.0 as f64, cur.1 as f64), 4.0, Stroke::new(1.0, Color32::from_rgb(0, 120, 255)));
+                    painter.circle_stroke(self.to_screen(canvas, cur.0 as f64, cur.1 as f64), 4.0, Stroke::new(1.0, self.pal().accent));
                     if resp.double_clicked() || resp.secondary_clicked() {
                         self.finish_wire();
                     } else if resp.clicked() {
@@ -2192,8 +2246,8 @@ impl App {
                 if let Some((px, py)) = pointer {
                     if let Some(pin) = self.pin_at(px, py) {
                         if let Some(p) = self.conn.find_pin(&pin) {
-                            painter.circle_stroke(self.to_screen(canvas, p.x as f64, p.y as f64), 7.0, Stroke::new(2.0, Color32::from_rgb(255, 120, 0)));
-                            painter.text(self.to_screen(canvas, p.x as f64, p.y as f64) + Vec2::new(8.0, -18.0), Align2::LEFT_TOP, &pin, FontId::proportional(13.0), Color32::from_rgb(200, 80, 0));
+                            painter.circle_stroke(self.to_screen(canvas, p.x as f64, p.y as f64), 7.0, Stroke::new(2.0, self.pal().accent_hi));
+                            painter.text(self.to_screen(canvas, p.x as f64, p.y as f64) + Vec2::new(8.0, -18.0), Align2::LEFT_TOP, &pin, FontId::proportional(13.0), self.pal().accent_hi);
                         }
                         if resp.clicked() {
                             match self.autowire_first.take() {
@@ -2211,7 +2265,7 @@ impl App {
                     }
                     if let Some(a) = &self.autowire_first {
                         if let Some(p) = self.conn.find_pin(a) {
-                            painter.line_segment([self.to_screen(canvas, p.x as f64, p.y as f64), hover.unwrap()], Stroke::new(1.0, Color32::from_rgb(255, 120, 0)));
+                            painter.line_segment([self.to_screen(canvas, p.x as f64, p.y as f64), hover.unwrap()], Stroke::new(1.0, self.pal().accent_hi));
                         }
                     }
                 }
@@ -2234,7 +2288,7 @@ impl App {
                         if let Some(st) = self.paint_start {
                             let a = self.to_screen(canvas, st.0 as f64, st.1 as f64);
                             let b = self.to_screen(canvas, cur.0 as f64, cur.1 as f64);
-                            let s = Stroke::new(1.5, Color32::from_rgb(0, 120, 255));
+                            let s = Stroke::new(1.5, self.pal().accent);
                             match kind.as_str() {
                                 "rect" => {
                                     painter.rect_stroke(Rect::from_two_pos(a, b), 0.0, s, egui::StrokeKind::Inside);
@@ -2288,7 +2342,7 @@ impl App {
         }
 
         // status text overlay (coordinates)
-        painter.text(canvas.right_bottom() - Vec2::new(8.0, 6.0), Align2::RIGHT_BOTTOM, format!("x={} y={}  zoom {:.0}%", self.cursor.0, self.cursor.1, self.zoom * 100.0 / 1.5), FontId::proportional(12.0), Color32::from_gray(110));
+        painter.text(canvas.right_bottom() - Vec2::new(8.0, 6.0), Align2::RIGHT_BOTTOM, format!("x={} y={}  zoom {:.0}%", self.cursor.0, self.cursor.1, self.zoom * 100.0 / 1.5), FontId::proportional(12.0), self.pal().muted);
         self.write_state(canvas);
     }
 
@@ -2321,7 +2375,7 @@ impl App {
         for &k in &self.sel_paint {
             if let Some(b) = self.doc.sch.paintings.get(k).and_then(|p| crate::edit::painting_bbox(p)) {
                 let r = Rect::from_two_pos(self.to_screen(canvas, b[0] - 3.0, b[1] - 3.0), self.to_screen(canvas, b[2] + 3.0, b[3] + 3.0));
-                painter.rect_stroke(r, 2.0, Stroke::new(1.5, Color32::from_rgb(255, 120, 0)), egui::StrokeKind::Outside);
+                painter.rect_stroke(r, 2.0, Stroke::new(1.5, self.pal().accent_hi), egui::StrokeKind::Outside);
             }
         }
         if resp.drag_started_by(egui::PointerButton::Primary) {
@@ -2399,8 +2453,8 @@ impl App {
         if let Some(b) = self.box_start {
             if let Some(h) = resp.hover_pos().or(resp.interact_pointer_pos()) {
                 let r = Rect::from_two_pos(b, h);
-                painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_rgb(0, 120, 255)), egui::StrokeKind::Inside);
-                painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0, 120, 255, 25));
+                painter.rect_stroke(r, 0.0, Stroke::new(1.0, self.pal().accent), egui::StrokeKind::Inside);
+                painter.rect_filled(r, 0.0, self.pal().accent.gamma_multiply(0.12));
             }
         }
         if resp.drag_stopped() {
@@ -2648,10 +2702,20 @@ impl eframe::App for App {
         );
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
 
+        let th = ctx.theme();
+        if th != self.tex_theme {
+            self.tex_theme = th;
+            self.gen += 1;
+            self.plot_dirty = true;
+            self.mc_textures(ctx);
+        }
+
         let screen = ctx.content_rect();
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui, screen));
-        egui::TopBottomPanel::top("tabs").show(ctx, |ui| self.tab_bar(ui));
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+        let pal = self.pal();
+        let bar = egui::Frame::new().fill(pal.bar).inner_margin(egui::Margin::symmetric(10, 6)).stroke(egui::Stroke::new(1.0, pal.border));
+        egui::TopBottomPanel::top("toolbar").frame(bar).show(ctx, |ui| self.toolbar(ui, screen));
+        egui::TopBottomPanel::top("tabs").frame(egui::Frame::new().fill(pal.bar).inner_margin(egui::Margin::symmetric(10, 3))).show(ctx, |ui| self.tab_bar(ui));
+        egui::TopBottomPanel::bottom("status").frame(bar.inner_margin(egui::Margin::symmetric(10, 3))).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if self.sim_rx.is_some() || self.mc.rx.is_some() {
                     ui.spinner();
@@ -2661,6 +2725,7 @@ impl eframe::App for App {
                     self.show_sim = true;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.theme_menu(ui);
                     let errs = self.issues.iter().filter(|i| i.severity == "error").count();
                     let warns = self.issues.len() - errs;
                     if ui.small_button(format!("⚠ エラー {errs} / 警告 {warns}")).clicked() {
@@ -2673,7 +2738,7 @@ impl eframe::App for App {
         if self.external_change {
             egui::TopBottomPanel::top("ext").show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(Color32::from_rgb(180, 90, 0), "ファイルが外部（AIエージェント）で変更されました。");
+                    ui.colored_label(self.pal().warn, "ファイルが外部（AIエージェント）で変更されました。");
                     if ui.button("再読み込み").clicked() {
                         self.reload_from_disk();
                     }
@@ -2689,7 +2754,7 @@ impl eframe::App for App {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     let mut goto = None;
                     for (k, i) in self.issues.iter().enumerate() {
-                        let c = if i.severity == "error" { Color32::RED } else { Color32::from_rgb(170, 110, 0) };
+                        let c = if i.severity == "error" { self.pal().error } else { self.pal().warn };
                         if ui.add(egui::Label::new(egui::RichText::new(format!("{}. [{}] {}", k + 1, i.kind, i.message)).color(c)).sense(Sense::click())).clicked() {
                             goto = Some(i.at);
                         }

@@ -18,6 +18,7 @@ mod router;
 mod schematic;
 mod sim;
 mod synth;
+mod theme;
 
 use std::path::PathBuf;
 

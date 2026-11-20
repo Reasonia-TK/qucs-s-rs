@@ -69,6 +69,8 @@ pub struct Overlay {
     pub selected: Vec<usize>,
     pub selected_wires: Vec<usize>,
     pub markers: Vec<(f64, f64, String)>, // issue markers
+    /// Wire / junction color override (GUI themes); `None` keeps Qucs dark blue.
+    pub wire_color: Option<Color>,
 }
 
 pub const NET_PALETTE: [Color; 10] = [
@@ -196,7 +198,7 @@ pub fn build_scene(sch: &Schematic, conn: &Connectivity, ov: &Overlay) -> Scene 
     // wires
     for (wi, w) in sch.wires.iter().enumerate() {
         let net = conn.wire_net.get(wi).copied().unwrap_or(0);
-        let mut color = if ov.color_nets { NET_PALETTE[net % NET_PALETTE.len()] } else { Color::WIRE };
+        let mut color = if ov.color_nets { NET_PALETTE[net % NET_PALETTE.len()] } else { ov.wire_color.unwrap_or(Color::WIRE) };
         let mut width = 2.0;
         if ov.highlight_nets.contains(&net) {
             sc.push(Shape::Line {
@@ -290,7 +292,7 @@ pub fn build_scene(sch: &Schematic, conn: &Connectivity, ov: &Overlay) -> Scene 
     let deg = conn.degree_map(sch);
     for (&(x, y), &d) in &deg {
         if d >= 3 {
-            sc.push(Shape::Ellipse { c: (x as f64, y as f64), rx: 4.0, ry: 4.0, color: Color::WIRE, width: 0.0, fill: Some(Color::WIRE) });
+            sc.push(Shape::Ellipse { c: (x as f64, y as f64), rx: 4.0, ry: 4.0, color: ov.wire_color.unwrap_or(Color::WIRE), width: 0.0, fill: Some(ov.wire_color.unwrap_or(Color::WIRE)) });
         }
     }
     for p in &conn.pins {
