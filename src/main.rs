@@ -2,16 +2,21 @@
 //! built-in MCP server, so AI agents see (and edit) exactly what the editor draws.
 
 mod check;
+mod diagram;
 mod doc;
+mod edit;
 mod gui;
 mod library;
 mod mcp;
 mod netlist;
 mod plot;
+mod qlib;
 mod render;
+mod rftools;
 mod router;
 mod schematic;
 mod sim;
+mod synth;
 
 use std::path::PathBuf;
 

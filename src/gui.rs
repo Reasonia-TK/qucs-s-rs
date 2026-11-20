@@ -33,7 +33,7 @@ fn detach_own_console() {
 pub fn run(path: Option<PathBuf>) {
     detach_own_console();
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 780.0]).with_title("Qucs-S RS"),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 780.0]).with_maximized(true).with_title("Qucs-S RS"),
         ..Default::default()
     };
     let _ = eframe::run_native("qucs-s-rs", opts, Box::new(move |cc| Ok(Box::new(App::new(cc, path)))));
@@ -46,6 +46,14 @@ enum Tool {
     AutoWire,
     Label,
     Place(String),
+    Paint(String),
+}
+
+/// What a primary-button drag in the select tool is moving.
+enum Grab {
+    WireLabel { wire: usize, orig: (i32, i32), start: (f64, f64) },
+    CompLabel { comp: usize, orig: (i32, i32), start: (f64, f64) },
+    Paintings { orig: Vec<(usize, String)>, start: (i32, i32), moved: (i32, i32) },
 }
 
 struct Drag {
@@ -67,11 +75,17 @@ struct App {
     sel: Vec<usize>,
     sel_wires: Vec<usize>,
     drag: Option<Drag>,
+    grab: Option<Grab>,
+    sel_paint: Vec<usize>,
+    paint_start: Option<(i32, i32)>,
+    text_prompt: Option<((i32, i32), String, Option<usize>)>,
     box_start: Option<Pos2>,
     wire_pts: Vec<(i32, i32)>,
     autowire_first: Option<String>,
     place_rot: i32,
     query: String,
+    lib_query: String,
+    palette_tab: u8,
     color_nets: bool,
     pin_names: bool,
     show_issues: bool,
@@ -99,6 +113,106 @@ struct App {
     last_state: String,
     last_state_write: Instant,
     icons: std::collections::HashMap<String, (Vec<Shape>, [f64; 4])>,
+    diag_kind: crate::diagram::DiagramKind,
+    markers: Vec<f64>,
+    marker_out: serde_json::Value,
+    plot_area: Option<(f64, f64, f64, f64, f64, f64, bool)>,
+    plot_px: (f32, f32),
+    tools: Tools,
+}
+
+/// State of the analysis / design tool windows.
+struct Tools {
+    filter_open: bool,
+    f_response: usize,
+    f_class: usize,
+    f_order: usize,
+    f_ripple: f64,
+    f_f1: String,
+    f_f2: String,
+    f_z0: f64,
+    f_series: bool,
+    f_bench: bool,
+    atten_open: bool,
+    a_topo: usize,
+    a_db: f64,
+    a_zin: f64,
+    a_zout: f64,
+    tline_open: bool,
+    t_coax: bool,
+    t_er: f64,
+    t_h: f64,
+    t_t: f64,
+    t_w: f64,
+    t_z0: f64,
+    t_freq: String,
+    t_d: f64,
+    t_dd: f64,
+    t_out: String,
+    sweep_open: bool,
+    s_param: String,
+    s_sim: String,
+    s_start: String,
+    s_stop: String,
+    s_points: String,
+    s_type: usize,
+    tune_open: bool,
+    tunes: Vec<Tune>,
+    tune_auto: bool,
+    result: String,
+}
+
+struct Tune {
+    comp: String,
+    prop: usize,
+    unit: String,
+    value: f64,
+    min: f64,
+    max: f64,
+}
+
+impl Default for Tools {
+    fn default() -> Self {
+        Tools {
+            filter_open: false,
+            f_response: 0,
+            f_class: 0,
+            f_order: 3,
+            f_ripple: 0.5,
+            f_f1: "10 MHz".into(),
+            f_f2: "20 MHz".into(),
+            f_z0: 50.0,
+            f_series: false,
+            f_bench: true,
+            atten_open: false,
+            a_topo: 0,
+            a_db: 10.0,
+            a_zin: 50.0,
+            a_zout: 50.0,
+            tline_open: false,
+            t_coax: false,
+            t_er: 4.4,
+            t_h: 1.6,
+            t_t: 35.0,
+            t_w: 3.0,
+            t_z0: 50.0,
+            t_freq: "1 GHz".into(),
+            t_d: 0.9,
+            t_dd: 2.95,
+            t_out: String::new(),
+            sweep_open: false,
+            s_param: String::new(),
+            s_sim: String::new(),
+            s_start: String::new(),
+            s_stop: String::new(),
+            s_points: "5".into(),
+            s_type: 0,
+            tune_open: false,
+            tunes: vec![],
+            tune_auto: true,
+            result: String::new(),
+        }
+    }
 }
 
 fn mtime(p: &PathBuf) -> Option<SystemTime> {
@@ -142,6 +256,14 @@ fn load_fonts(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
+}
+
+/// Component for a palette key: a type name, or "Lib:<library>/<component>".
+fn spec_component(spec: &str, x: i32, y: i32) -> Result<crate::schematic::Component, String> {
+    match spec.strip_prefix("Lib:").and_then(|r| r.split_once('/')) {
+        Some((l, c)) => crate::qlib::new_lib_component(l, c, "X", x, y),
+        None => library::new_component(spec, "?", x, y),
+    }
 }
 
 fn paint_shapes_xf(painter: &egui::Painter, shapes: &[Shape], alpha: f32, z: f32, xf: &dyn Fn(f64, f64) -> Pos2) {
@@ -240,11 +362,17 @@ impl App {
             sel: vec![],
             sel_wires: vec![],
             drag: None,
+            grab: None,
+            sel_paint: vec![],
+            paint_start: None,
+            text_prompt: None,
             box_start: None,
             wire_pts: vec![],
             autowire_first: None,
             place_rot: 0,
             query: String::new(),
+            lib_query: String::new(),
+            palette_tab: 0,
             color_nets: false,
             pin_names: false,
             show_issues: true,
@@ -272,6 +400,12 @@ impl App {
             last_state: String::new(),
             last_state_write: Instant::now(),
             icons: Default::default(),
+            diag_kind: crate::diagram::DiagramKind::Rect,
+            markers: vec![],
+            marker_out: serde_json::Value::Null,
+            plot_area: None,
+            plot_px: (0.0, 0.0),
+            tools: Tools::default(),
         }
     }
 
@@ -349,7 +483,7 @@ impl App {
             "selected_wires": self.sel_wires.iter().filter_map(|&i| self.doc.sch.wires.get(i).map(|w| serde_json::json!({"i": i, "p": [w.x1, w.y1, w.x2, w.y2]}))).collect::<Vec<_>>(),
             "visible_region": [tl.0, tl.1, br.0, br.1],
             "cursor": [self.cursor.0, self.cursor.1],
-            "tool": match &self.tool { Tool::Select => "select".to_string(), Tool::Wire => "wire".into(), Tool::AutoWire => "autowire".into(), Tool::Label => "label".into(), Tool::Place(t) => format!("place:{t}") },
+            "tool": match &self.tool { Tool::Select => "select".to_string(), Tool::Wire => "wire".into(), Tool::AutoWire => "autowire".into(), Tool::Label => "label".into(), Tool::Place(t) => format!("place:{t}"), Tool::Paint(k) => format!("paint:{k}") },
             "unsaved_changes": self.doc.dirty,
         })
         .to_string();
@@ -472,11 +606,123 @@ impl App {
         }
     }
 
-    fn delete_selected(&mut self) {
-        if self.sel.is_empty() && self.sel_wires.is_empty() {
+    fn copy_selection(&mut self, ctx: &egui::Context, cut: bool) {
+        if self.sel.is_empty() && self.sel_wires.is_empty() && self.sel_paint.is_empty() {
+            return;
+        }
+        let text = crate::edit::copy_text(&self.doc, &self.sel, &self.sel_wires, &self.sel_paint);
+        ctx.copy_text(text);
+        self.status = format!("{} 個の部品をコピー", self.sel.len());
+        if cut {
+            self.delete_selected();
+        }
+    }
+
+    fn paste(&mut self, text: &str) {
+        // place the clip so that its top-left lands at the cursor
+        let Ok(clip) = Schematic::parse(text.trim()) else {
+            self.status = "クリップボードに回路図データがありません".into();
+            return;
+        };
+        let mut minx = i32::MAX;
+        let mut miny = i32::MAX;
+        for c in &clip.components {
+            minx = minx.min(c.x);
+            miny = miny.min(c.y);
+        }
+        for w in &clip.wires {
+            minx = minx.min(w.x1.min(w.x2));
+            miny = miny.min(w.y1.min(w.y2));
+        }
+        if minx == i32::MAX {
+            minx = self.cursor.0;
+            miny = self.cursor.1;
+        }
+        self.doc.checkpoint();
+        match crate::edit::paste_text(&mut self.doc, text, snap(self.cursor.0 - minx), snap(self.cursor.1 - miny)) {
+            Ok((c, w, p)) => {
+                self.status = format!("{} 個の部品を貼り付け", c.len());
+                self.changed();
+                self.sel = c;
+                self.sel_wires = w;
+                self.sel_paint = p;
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    fn duplicate_selection(&mut self) {
+        if self.sel.is_empty() && self.sel_paint.is_empty() {
             return;
         }
         self.doc.checkpoint();
+        match crate::edit::duplicate(&mut self.doc, &self.sel.clone(), &self.sel_wires.clone(), &self.sel_paint.clone(), 40, 40) {
+            Ok((c, w, p)) => {
+                self.changed();
+                self.sel = c;
+                self.sel_wires = w;
+                self.sel_paint = p;
+                self.status = "複製しました".into();
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    fn mirror_y_selected(&mut self) {
+        if self.sel.is_empty() {
+            return;
+        }
+        self.doc.checkpoint();
+        for &i in &self.sel.clone() {
+            crate::edit::mirror_y(&mut self.doc.sch.components[i]);
+            self.doc.default_label_pos(i);
+        }
+        self.reroute_selected();
+        self.changed();
+    }
+
+    fn align_selected(&mut self, mode: &str) {
+        match crate::edit::align(&self.doc, &self.sel, mode) {
+            Ok(moves) => {
+                self.doc.checkpoint();
+                if let Err(e) = self.doc.move_components(&moves, self.auto_reroute) {
+                    self.status = e;
+                }
+                self.changed();
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    fn export_image(&mut self) {
+        let Some(p) = rfd::FileDialog::new().add_filter("PNG", &["png"]).add_filter("SVG", &["svg"]).set_file_name("schematic.png").save_file() else { return };
+        let ov = Overlay::default();
+        let sc = build_scene(&self.doc.sch, &self.conn, &ov);
+        let view = crate::render::fit_view(sc.bounds, 30.0, Some(2.0), 6000.0);
+        let (svg, _) = crate::render::scene_svg(&sc, &view, &crate::render::Decor::default());
+        let res = if p.extension().map(|e| e.eq_ignore_ascii_case("svg")).unwrap_or(false) {
+            std::fs::write(&p, svg).map_err(|e| e.to_string())
+        } else {
+            crate::render::svg_to_png(&svg).and_then(|png| std::fs::write(&p, png).map_err(|e| e.to_string()))
+        };
+        self.status = match res {
+            Ok(_) => format!("書き出し: {}", p.display()),
+            Err(e) => format!("書き出し失敗: {e}"),
+        };
+    }
+
+    fn delete_selected(&mut self) {
+        if self.sel.is_empty() && self.sel_wires.is_empty() && self.sel_paint.is_empty() {
+            return;
+        }
+        self.doc.checkpoint();
+        let mut ps = std::mem::take(&mut self.sel_paint);
+        ps.sort_unstable();
+        for &k in ps.iter().rev() {
+            if k < self.doc.sch.paintings.len() {
+                self.doc.sch.paintings.remove(k);
+            }
+        }
         let names: Vec<String> = self.sel.iter().map(|&i| self.doc.sch.components[i].name.clone()).collect();
         let _ = self.doc.delete_components(&names);
         let mut ws = self.sel_wires.clone();
@@ -663,6 +909,35 @@ impl App {
             if ui.button("▶ シミュレーション").clicked() {
                 self.run_sim();
             }
+            ui.menu_button("✏ 図形", |ui| {
+                for (k, label) in [("line", "線"), ("rect", "矩形"), ("ellipse", "楕円"), ("arrow", "矢印"), ("text", "テキスト (T)")] {
+                    if ui.button(label).clicked() {
+                        self.tool = Tool::Paint(k.into());
+                        ui.close();
+                    }
+                }
+            });
+            ui.menu_button("✂ 編集", |ui| {
+                if ui.button("複製 (Ctrl+D)").clicked() {
+                    self.duplicate_selection();
+                    ui.close();
+                }
+                if ui.button("Y軸ミラー (Y)").clicked() {
+                    self.mirror_y_selected();
+                    ui.close();
+                }
+                ui.separator();
+                for (m, label) in [("left", "左揃え"), ("right", "右揃え"), ("top", "上揃え"), ("bottom", "下揃え"), ("vcenter", "縦中心揃え"), ("hcenter", "横中心揃え"), ("distribute_h", "横に等間隔"), ("distribute_v", "縦に等間隔")] {
+                    if ui.add_enabled(self.sel.len() >= 2, egui::Button::new(label)).clicked() {
+                        self.align_selected(m);
+                        ui.close();
+                    }
+                }
+            });
+            self.tools_menu(ui);
+            if ui.button("🖼 書き出し").on_hover_text("PNG / SVG").clicked() {
+                self.export_image();
+            }
             if ui.button("⛶ 全体表示").on_hover_text("F").clicked() {
                 self.fit(canvas_hint);
             }
@@ -685,7 +960,7 @@ impl App {
         self.icons.entry(typ.to_string()).or_insert_with(|| {
             let mut shapes = Vec::new();
             let mut bb = [-20.0, -20.0, 20.0, 20.0];
-            if let Ok(c) = library::new_component(typ, "", 0, 0) {
+            if let Ok(c) = spec_component(typ, 0, 0) {
                 let p = library::place(&c, None);
                 for prim in &p.prims {
                     crate::render::prim_shapes(prim, &mut shapes, None);
@@ -700,12 +975,12 @@ impl App {
     }
 
     /// Palette entry: symbol icon + name, like the Qucs-S component list.
-    fn palette_row(&mut self, ui: &mut egui::Ui, typ: &str, caption: &str, selected: bool) -> egui::Response {
+    fn palette_row(&mut self, ui: &mut egui::Ui, typ: &str, caption: &str, sub_line: &str, selected: bool) -> egui::Response {
         const ICON: Vec2 = Vec2::new(46.0, 34.0);
         let w = ui.available_width();
         // lay the text out first: long captions wrap, and the row grows to fit them
         let text_color = ui.visuals().text_color();
-        let galley = ui.painter().layout(format!("{caption}\n{typ}"), FontId::proportional(12.5), text_color, (w - ICON.x - 12.0).max(40.0));
+        let galley = ui.painter().layout(format!("{caption}\n{sub_line}"), FontId::proportional(12.5), text_color, (w - ICON.x - 12.0).max(40.0));
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, ICON.y.max(galley.size().y) + 4.0), Sense::click());
         if !ui.is_rect_visible(rect) {
             return resp;
@@ -728,7 +1003,14 @@ impl App {
     }
 
     fn palette(&mut self, ui: &mut egui::Ui) {
-        ui.heading("部品");
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.palette_tab, 0, egui::RichText::new("部品").heading());
+            ui.selectable_value(&mut self.palette_tab, 1, egui::RichText::new("ライブラリ").heading());
+        });
+        if self.palette_tab == 1 {
+            self.library_browser(ui);
+            return;
+        }
         ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("検索 (R, opamp, diode…)"));
         let q = self.query.to_ascii_lowercase();
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -748,9 +1030,47 @@ impl App {
                 egui::CollapsingHeader::new(format!("{cat} ({})", items.len())).default_open(!q.is_empty() || cat == "lumped components" || cat == "sources").show(ui, |ui| {
                     for c in items {
                         let selected = self.tool == Tool::Place(c.typ.clone());
-                        if self.palette_row(ui, &c.typ, &c.caption, selected).on_hover_text(&c.description).clicked() {
+                        if self.palette_row(ui, &c.typ, &c.caption, &c.typ, selected).on_hover_text(&c.description).clicked() {
                             self.tool = Tool::Place(c.typ.clone());
                             self.place_rot = library::new_component(&c.typ, "X", 0, 0).map(|c| c.rotate).unwrap_or(0);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// Qucs-S component libraries (real parts) with symbol icons.
+    fn library_browser(&mut self, ui: &mut egui::Ui) {
+        ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("検索 (lm358, 1n4148, irf…)"));
+        let libs = crate::qlib::libraries();
+        if libs.is_empty() {
+            ui.label("Qucs-S のライブラリが見つかりません（QUCS_S_LIBRARY で指定できます）");
+            return;
+        }
+        let words: Vec<String> = self.lib_query.to_lowercase().split_whitespace().map(|s| s.to_string()).collect();
+        egui::ScrollArea::vertical().id_salt("libs").show(ui, |ui| {
+            for l in libs {
+                let items: Vec<&crate::qlib::LibComp> = l
+                    .comps
+                    .iter()
+                    .filter(|c| {
+                        let hay = format!("{} {} {}", l.name, c.name, c.description).to_lowercase();
+                        words.iter().all(|w| hay.contains(w))
+                    })
+                    .collect();
+                if items.is_empty() {
+                    continue;
+                }
+                let title = format!("{} ({}){}", l.name, items.len(), if l.ngspice_ok { "" } else { "  ⚠ngspice非対応" });
+                egui::CollapsingHeader::new(title).id_salt(&l.name).default_open(!words.is_empty() && items.len() <= 30).show(ui, |ui| {
+                    for c in items.iter().take(400) {
+                        let key = format!("Lib:{}/{}", l.name, c.name);
+                        let selected = self.tool == Tool::Place(key.clone());
+                        let desc: String = c.description.chars().take(60).collect();
+                        if self.palette_row(ui, &key, &c.name, &desc, selected).on_hover_text(&c.description).clicked() {
+                            self.tool = Tool::Place(key);
+                            self.place_rot = 0;
                         }
                     }
                 });
@@ -765,10 +1085,17 @@ impl App {
                 ui.label("部品を選択すると編集できます。");
             } else {
                 ui.label(format!("{} 個選択中", self.sel.len()));
+                ui.horizontal_wrapped(|ui| {
+                    for (m, label) in [("left", "⇤ 左"), ("right", "⇥ 右"), ("top", "⤒ 上"), ("bottom", "⤓ 下"), ("vcenter", "縦中心"), ("hcenter", "横中心"), ("distribute_h", "横等間隔"), ("distribute_v", "縦等間隔")] {
+                        if ui.button(label).clicked() {
+                            self.align_selected(m);
+                        }
+                    }
+                });
             }
             ui.separator();
             ui.label("ショートカット");
-            ui.small("R 回転 / M ミラー / Del 削除\nW 配線 / A 自動配線 / L ラベル\nCtrl+Z/Y 元に戻す/やり直し\nホイール: ズーム, 中/右ドラッグ: パン\nF 全体表示");
+            ui.small("Ctrl+C/X/V/D コピー/切り取り/貼り付け/複製\nCtrl+A 全選択 / Y Y軸ミラー / T テキスト\nR 回転 / M ミラー / Del 削除\nW 配線 / A 自動配線 / L ラベル\nCtrl+Z/Y 元に戻す/やり直し\nホイール: ズーム, 中/右ドラッグ: パン\nF 全体表示");
             return;
         }
         let ci = self.sel[0];
@@ -816,13 +1143,32 @@ impl App {
                 for (k, p) in c.props.iter().enumerate() {
                     let pname = library::prop_name(&c, k);
                     let desc = info.and_then(|i| i.props.get(k)).map(|p| p.description.clone()).unwrap_or_default();
-                    ui.label(&pname).on_hover_text(desc);
+                    ui.label(&pname).on_hover_text(&desc);
                     if k >= self.prop_buf.len() {
                         self.prop_buf.push(p.value.clone());
                     }
-                    let r = ui.add(egui::TextEdit::singleline(&mut self.prop_buf[k]).desired_width(130.0));
-                    if r.lost_focus() && self.prop_buf[k] != p.value {
-                        commit = Some((k, self.prop_buf[k].clone()));
+                    // "[a, b, c]" in the description -> choice list (like Qucs-S' property dialog)
+                    let options: Vec<String> = desc
+                        .rsplit_once('[')
+                        .and_then(|(_, r)| r.split_once(']'))
+                        .map(|(o, _)| o.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+                        .unwrap_or_default();
+                    if options.len() >= 2 && options.len() <= 30 {
+                        let mut v = p.value.clone();
+                        egui::ComboBox::from_id_salt(("prop", k)).width(130.0).selected_text(&v).show_ui(ui, |ui| {
+                            for o in &options {
+                                ui.selectable_value(&mut v, o.clone(), o);
+                            }
+                        });
+                        if v != p.value {
+                            self.prop_buf[k] = v.clone();
+                            commit = Some((k, v));
+                        }
+                    } else {
+                        let r = ui.add(egui::TextEdit::singleline(&mut self.prop_buf[k]).desired_width(130.0));
+                        if r.lost_focus() && self.prop_buf[k] != p.value {
+                            commit = Some((k, self.prop_buf[k].clone()));
+                        }
                     }
                     let mut vis = p.visible();
                     if ui.checkbox(&mut vis, "").on_hover_text("回路図に表示").changed() {
@@ -848,11 +1194,12 @@ impl App {
     }
 
     fn sim_window(&mut self, ctx: &egui::Context) {
+        use crate::diagram::DiagramKind as K;
         if !self.show_sim {
             return;
         }
         let mut open = true;
-        egui::Window::new("シミュレーション結果").open(&mut open).default_size([920.0, 640.0]).show(ctx, |ui| {
+        egui::Window::new("シミュレーション結果").open(&mut open).default_size([940.0, 700.0]).show(ctx, |ui| {
             let Some(r) = &self.sim else {
                 ui.label("結果なし");
                 return;
@@ -863,28 +1210,44 @@ impl App {
             if r.plots.is_empty() {
                 return;
             }
-            let names: Vec<String> = r.plots.iter().map(|p| format!("{} ({})", p.name, p.kind)).collect();
+            // sweep steps are grouped under their base analysis
+            let mut entries: Vec<(String, usize)> = Vec::new();
+            for (k, p) in r.plots.iter().enumerate() {
+                if p.sweep.is_some() {
+                    if !entries.iter().any(|e| e.0.starts_with(&format!("{} ", p.base))) {
+                        entries.push((format!("{} ({}, スイープ)", p.base, p.kind), k));
+                    }
+                } else {
+                    entries.push((format!("{} ({})", p.name, p.kind), k));
+                }
+            }
             let mut changed = false;
             ui.horizontal(|ui| {
-                egui::ComboBox::from_label("解析").selected_text(names.get(self.plot_analysis).cloned().unwrap_or_default()).show_ui(ui, |ui| {
-                    for (k, n) in names.iter().enumerate() {
-                        changed |= ui.selectable_value(&mut self.plot_analysis, k, n).changed();
+                let cur = entries.iter().find(|e| e.1 == self.plot_analysis).map(|e| e.0.clone()).unwrap_or_default();
+                egui::ComboBox::from_label("解析").selected_text(cur).show_ui(ui, |ui| {
+                    for (n, k) in &entries {
+                        if ui.selectable_value(&mut self.plot_analysis, *k, n).changed() {
+                            changed = true;
+                            self.markers.clear();
+                        }
                     }
                 });
+                ui.separator();
+                for (k, label) in [(K::Rect, "直交"), (K::Polar, "極座標"), (K::Smith, "スミス"), (K::Table, "表")] {
+                    if ui.selectable_label(self.diag_kind == k, label).clicked() {
+                        self.diag_kind = k;
+                        changed = true;
+                    }
+                }
+                ui.separator();
+                if ui.button("マーカー消去").clicked() {
+                    self.markers.clear();
+                    changed = true;
+                }
             });
             let p = &r.plots[self.plot_analysis.min(r.plots.len() - 1)];
-            if p.kind == "op" {
-                egui::Grid::new("op").striped(true).show(ui, |ui| {
-                    for v in &p.vectors {
-                        ui.label(&v.name);
-                        ui.label(crate::plot::eng(v.re[0]));
-                        ui.end_row();
-                    }
-                });
-                return;
-            }
             ui.horizontal_wrapped(|ui| {
-                for v in p.vectors.iter().skip(1) {
+                for v in p.vectors.iter().skip(if p.kind == "op" { 0 } else { 1 }) {
                     let mut on = self.plot_vectors.contains(&v.name);
                     if ui.checkbox(&mut on, &v.name).changed() {
                         if on {
@@ -901,25 +1264,399 @@ impl App {
             }
             if self.plot_dirty || self.plot_tex.is_none() {
                 self.plot_dirty = false;
-                let base = p.base.clone();
-                let plots = r.find_all(Some(if p.sweep.is_some() { &base } else { &p.name })).unwrap_or_default();
-                let vecs: Vec<String> = self.plot_vectors.iter().filter(|n| p.vector(n).is_some()).cloned().collect();
-                if let Ok(svg) = crate::plot::plot_analysis(&plots, &vecs, None) {
-                    if let Ok((w, h, rgba)) = crate::render::svg_to_rgba(&svg) {
-                        let img = egui::ColorImage::from_rgba_premultiplied([w as usize, h as usize], &rgba);
-                        self.plot_tex = Some(ctx.load_texture("plot", img, egui::TextureOptions::LINEAR));
+                let plots = r.find_all(Some(if p.sweep.is_some() { &p.base } else { &p.name })).unwrap_or_default();
+                let kind = if p.kind == "op" { K::Table } else { self.diag_kind.clone() };
+                let spec = crate::diagram::DiagramSpec {
+                    kind,
+                    vectors: self.plot_vectors.iter().filter(|n| p.vector(n).is_some()).cloned().collect(),
+                    markers: self.markers.clone(),
+                    ..Default::default()
+                };
+                match crate::diagram::diagram_svg(&plots, &spec, 900.0, if spec.kind == K::Rect { 520.0 } else { 640.0 }) {
+                    Ok(out) => {
+                        self.marker_out = out.markers.clone();
+                        self.plot_area = out.plot_area;
+                        if let Ok((w, h, rgba)) = crate::render::svg_to_rgba(&out.svg) {
+                            let img = egui::ColorImage::from_rgba_premultiplied([w as usize, h as usize], &rgba);
+                            self.plot_px = (w as f32, h as f32);
+                            self.plot_tex = Some(ctx.load_texture("plot", img, egui::TextureOptions::LINEAR));
+                        }
+                    }
+                    Err(e) => {
+                        self.status = e;
+                        self.plot_tex = None;
+                        self.plot_area = None;
                     }
                 }
             }
             if let Some(t) = &self.plot_tex {
                 let avail = ui.available_width();
-                let s = t.size_vec2();
-                ui.image((t.id(), s * (avail / s.x).min(1.0)));
+                let sz = t.size_vec2();
+                let k = (avail / sz.x).min(1.0);
+                let resp = ui.add(egui::Image::new((t.id(), sz * k)).sense(Sense::click()));
+                // click inside the plot area places a marker at that x
+                if let (true, Some(pos), Some((l, _tp, w, _h, x0, x1, log))) = (resp.clicked(), resp.interact_pointer_pos(), self.plot_area) {
+                    let px = ((pos.x - resp.rect.min.x) / k) as f64;
+                    let f = ((px - l) / w).clamp(0.0, 1.0);
+                    let x = if log { (x0.ln() + f * (x1.ln() - x0.ln())).exp() } else { x0 + f * (x1 - x0) };
+                    self.markers.push(x);
+                    self.plot_dirty = true;
+                }
+                if self.plot_area.is_some() {
+                    ui.small("グラフをクリックするとマーカーを追加します");
+                }
+            }
+            if let Some(arr) = self.marker_out.as_array() {
+                if !arr.is_empty() {
+                    egui::Grid::new("markers").striped(true).show(ui, |ui| {
+                        for m in arr {
+                            ui.label(crate::plot::eng(m.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0)));
+                            ui.label(m.get("label").or(m.get("vector")).and_then(|v| v.as_str()).unwrap_or(""));
+                            let v = m.get("value").cloned().unwrap_or_default();
+                            let txt = match &v {
+                                serde_json::Value::Number(n) => crate::plot::eng(n.as_f64().unwrap_or(0.0)),
+                                serde_json::Value::Object(o) => format!(
+                                    "{} dB, {:.1}°",
+                                    o.get("db").and_then(|x| x.as_f64()).map(|x| format!("{x:.2}")).unwrap_or_default(),
+                                    o.get("phase_deg").and_then(|x| x.as_f64()).unwrap_or(0.0)
+                                ),
+                                _ => "-".into(),
+                            };
+                            ui.label(txt);
+                            ui.end_row();
+                        }
+                    });
+                }
             }
         });
         if !open {
             self.show_sim = false;
         }
+    }
+
+    // ------------------------------------------------------------------ tools
+
+    fn tools_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("⚙ ツール", |ui| {
+            if ui.button("フィルタ設計…").clicked() {
+                self.tools.filter_open = true;
+                ui.close();
+            }
+            if ui.button("減衰器設計…").clicked() {
+                self.tools.atten_open = true;
+                ui.close();
+            }
+            if ui.button("伝送線路計算…").clicked() {
+                self.tools.tline_open = true;
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("パラメータスイープ…").clicked() {
+                if let Some(&ci) = self.sel.first() {
+                    let c = &self.doc.sch.components[ci];
+                    self.tools.s_param = c.name.clone();
+                    if let Some(v) = c.props.first().and_then(|p| crate::rftools::parse_value(&p.value)) {
+                        self.tools.s_start = crate::plot::eng(v / 2.0);
+                        self.tools.s_stop = crate::plot::eng(v * 2.0);
+                    }
+                }
+                if self.tools.s_sim.is_empty() {
+                    self.tools.s_sim = self.doc.sch.components.iter().find(|c| c.typ.starts_with('.') && c.typ != ".SW").map(|c| c.name.clone()).unwrap_or_default();
+                }
+                self.tools.sweep_open = true;
+                ui.close();
+            }
+            if ui.button("チューニング…").clicked() {
+                self.tools.tune_open = true;
+                ui.close();
+            }
+        });
+    }
+
+    fn place_design(&mut self, d: Result<crate::rftools::Design, String>, bench: Option<(f64, f64, f64, f64)>) {
+        let d = match d {
+            Ok(d) => d,
+            Err(e) => {
+                self.tools.result = e;
+                return;
+            }
+        };
+        let conn = self.doc.conn();
+        let maxy = conn.placed.iter().map(|p| p.bbox[3]).fold(0.0f64, f64::max);
+        let (x, y) = (300, (maxy as i32 + 120).max(120));
+        self.doc.checkpoint();
+        match crate::synth::place_design(&mut self.doc, &d, x, y, bench) {
+            Ok(_) => {
+                self.tools.result = format!("{}\n{}", d.title, d.notes.join("\n"));
+                self.need_fit = true;
+                self.changed();
+            }
+            Err(e) => self.tools.result = e,
+        }
+    }
+
+    fn tool_windows(&mut self, ctx: &egui::Context) {
+        // ---------- filter
+        let mut open = self.tools.filter_open;
+        egui::Window::new("フィルタ設計").open(&mut open).resizable(false).show(ctx, |ui| {
+            let t = &mut self.tools;
+            egui::Grid::new("filt").num_columns(2).show(ui, |ui| {
+                ui.label("特性");
+                egui::ComboBox::from_id_salt("fr").selected_text(["Butterworth", "Chebyshev", "Bessel"][t.f_response]).show_ui(ui, |ui| {
+                    for (k, n) in ["Butterworth", "Chebyshev", "Bessel"].iter().enumerate() {
+                        ui.selectable_value(&mut t.f_response, k, *n);
+                    }
+                });
+                ui.end_row();
+                ui.label("種類");
+                egui::ComboBox::from_id_salt("fc").selected_text(["ローパス", "ハイパス", "バンドパス", "バンドストップ"][t.f_class]).show_ui(ui, |ui| {
+                    for (k, n) in ["ローパス", "ハイパス", "バンドパス", "バンドストップ"].iter().enumerate() {
+                        ui.selectable_value(&mut t.f_class, k, *n);
+                    }
+                });
+                ui.end_row();
+                ui.label("次数");
+                ui.add(egui::DragValue::new(&mut t.f_order).range(1..=10));
+                ui.end_row();
+                if t.f_response == 1 {
+                    ui.label("リップル [dB]");
+                    ui.add(egui::DragValue::new(&mut t.f_ripple).range(0.01..=3.0).speed(0.01));
+                    ui.end_row();
+                }
+                ui.label(if t.f_class >= 2 { "下側周波数" } else { "カットオフ周波数" });
+                ui.text_edit_singleline(&mut t.f_f1);
+                ui.end_row();
+                if t.f_class >= 2 {
+                    ui.label("上側周波数");
+                    ui.text_edit_singleline(&mut t.f_f2);
+                    ui.end_row();
+                }
+                ui.label("インピーダンス [Ω]");
+                ui.add(egui::DragValue::new(&mut t.f_z0).range(1.0..=1e6));
+                ui.end_row();
+                ui.label("構成");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut t.f_series, false, "π (並列から)");
+                    ui.radio_value(&mut t.f_series, true, "T (直列から)");
+                });
+                ui.end_row();
+            });
+            ui.checkbox(&mut t.f_bench, "テスト回路（信号源・負荷・AC解析）も追加");
+            if ui.button("設計して配置").clicked() {
+                let args = serde_json::json!({
+                    "response": (["butterworth", "chebyshev", "bessel"][t.f_response]), "ripple_db": t.f_ripple,
+                    "class": (["lowpass", "highpass", "bandpass", "bandstop"][t.f_class]), "order": t.f_order,
+                    "f1": t.f_f1, "f2": t.f_f2, "z0": t.f_z0, "first_series": t.f_series,
+                });
+                let bench_on = t.f_bench;
+                let spec = crate::synth::filter_spec(&args);
+                match spec {
+                    Ok(spec) => {
+                        let d = crate::rftools::lc_filter(&spec);
+                        let zl = d.as_ref().ok().and_then(|d| d.values.get("z_load").and_then(|v| v.as_f64())).unwrap_or(spec.z0);
+                        let (lo, hi) = crate::synth::bench_range(&spec);
+                        self.place_design(d, bench_on.then_some((spec.z0, zl, lo, hi)));
+                    }
+                    Err(e) => self.tools.result = e,
+                }
+            }
+            if !self.tools.result.is_empty() {
+                ui.label(&self.tools.result);
+            }
+        });
+        self.tools.filter_open = open;
+
+        // ---------- attenuator
+        let mut open = self.tools.atten_open;
+        egui::Window::new("減衰器設計").open(&mut open).resizable(false).show(ctx, |ui| {
+            let t = &mut self.tools;
+            egui::Grid::new("att").num_columns(2).show(ui, |ui| {
+                ui.label("構成");
+                egui::ComboBox::from_id_salt("at").selected_text(["π型", "T型", "ブリッジT型"][t.a_topo]).show_ui(ui, |ui| {
+                    for (k, n) in ["π型", "T型", "ブリッジT型"].iter().enumerate() {
+                        ui.selectable_value(&mut t.a_topo, k, *n);
+                    }
+                });
+                ui.end_row();
+                ui.label("減衰量 [dB]");
+                ui.add(egui::DragValue::new(&mut t.a_db).range(0.1..=100.0).speed(0.1));
+                ui.end_row();
+                ui.label("入力 Z [Ω]");
+                ui.add(egui::DragValue::new(&mut t.a_zin).range(1.0..=1e6));
+                ui.end_row();
+                ui.label("出力 Z [Ω]");
+                ui.add(egui::DragValue::new(&mut t.a_zout).range(1.0..=1e6));
+                ui.end_row();
+            });
+            if ui.button("設計して配置").clicked() {
+                let topo = [crate::rftools::AttenuatorTopology::Pi, crate::rftools::AttenuatorTopology::Tee, crate::rftools::AttenuatorTopology::BridgedTee][t.a_topo];
+                let (db, zi, zo) = (t.a_db, t.a_zin, t.a_zout);
+                let d = crate::rftools::attenuator(topo, db, zi, zo);
+                self.place_design(d, None);
+            }
+            if !self.tools.result.is_empty() {
+                ui.label(&self.tools.result);
+            }
+        });
+        self.tools.atten_open = open;
+
+        // ---------- transmission line
+        let mut open = self.tools.tline_open;
+        egui::Window::new("伝送線路計算").open(&mut open).resizable(false).show(ctx, |ui| {
+            let t = &mut self.tools;
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut t.t_coax, false, "マイクロストリップ");
+                ui.radio_value(&mut t.t_coax, true, "同軸");
+            });
+            egui::Grid::new("tl").num_columns(2).show(ui, |ui| {
+                ui.label("εr");
+                ui.add(egui::DragValue::new(&mut t.t_er).range(1.0..=100.0).speed(0.01));
+                ui.end_row();
+                if t.t_coax {
+                    ui.label("内導体径 d [mm]");
+                    ui.add(egui::DragValue::new(&mut t.t_d).speed(0.01));
+                    ui.end_row();
+                    ui.label("外導体内径 D [mm]");
+                    ui.add(egui::DragValue::new(&mut t.t_dd).speed(0.01));
+                    ui.end_row();
+                } else {
+                    ui.label("基板厚 h [mm]");
+                    ui.add(egui::DragValue::new(&mut t.t_h).speed(0.01));
+                    ui.end_row();
+                    ui.label("銅箔厚 t [µm]");
+                    ui.add(egui::DragValue::new(&mut t.t_t).speed(1.0));
+                    ui.end_row();
+                    ui.label("線幅 w [mm]");
+                    ui.add(egui::DragValue::new(&mut t.t_w).speed(0.01));
+                    ui.end_row();
+                    ui.label("目標 Z0 [Ω]");
+                    ui.add(egui::DragValue::new(&mut t.t_z0).speed(0.1));
+                    ui.end_row();
+                }
+                ui.label("周波数");
+                ui.text_edit_singleline(&mut t.t_freq);
+                ui.end_row();
+            });
+            ui.horizontal(|ui| {
+                if !t.t_coax {
+                    if ui.button("解析 (w → Z0)").clicked() {
+                        let a = serde_json::json!({"kind": "microstrip", "er": t.t_er, "h_mm": t.t_h, "t_um": t.t_t, "w_mm": t.t_w, "freq": t.t_freq});
+                        t.t_out = crate::synth::tline(&a).map(|v| serde_json::to_string_pretty(&v).unwrap()).unwrap_or_else(|e| e);
+                    }
+                    if ui.button("合成 (Z0 → w)").clicked() {
+                        let a = serde_json::json!({"kind": "microstrip", "er": t.t_er, "h_mm": t.t_h, "t_um": t.t_t, "z0": t.t_z0, "freq": t.t_freq});
+                        let r = crate::synth::tline(&a);
+                        if let Ok(v) = &r {
+                            if let Some(w) = v.get("w_mm").and_then(|x| x.as_f64()) {
+                                t.t_w = w;
+                            }
+                        }
+                        t.t_out = r.map(|v| serde_json::to_string_pretty(&v).unwrap()).unwrap_or_else(|e| e);
+                    }
+                } else if ui.button("計算").clicked() {
+                    let a = serde_json::json!({"kind": "coax", "er": t.t_er, "d_inner_mm": t.t_d, "d_outer_mm": t.t_dd, "freq": t.t_freq});
+                    t.t_out = crate::synth::tline(&a).map(|v| serde_json::to_string_pretty(&v).unwrap()).unwrap_or_else(|e| e);
+                }
+            });
+            if !t.t_out.is_empty() {
+                ui.monospace(&t.t_out);
+            }
+        });
+        self.tools.tline_open = open;
+
+        // ---------- parameter sweep
+        let mut open = self.tools.sweep_open;
+        let mut add = false;
+        egui::Window::new("パラメータスイープ").open(&mut open).resizable(false).show(ctx, |ui| {
+            let t = &mut self.tools;
+            egui::Grid::new("sw").num_columns(2).show(ui, |ui| {
+                ui.label("部品名 / 変数");
+                ui.text_edit_singleline(&mut t.s_param);
+                ui.end_row();
+                ui.label("対象の解析");
+                ui.text_edit_singleline(&mut t.s_sim);
+                ui.end_row();
+                ui.label("開始");
+                ui.text_edit_singleline(&mut t.s_start);
+                ui.end_row();
+                ui.label("終了");
+                ui.text_edit_singleline(&mut t.s_stop);
+                ui.end_row();
+                ui.label("点数");
+                ui.text_edit_singleline(&mut t.s_points);
+                ui.end_row();
+                ui.label("刻み");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut t.s_type, 0, "lin");
+                    ui.radio_value(&mut t.s_type, 1, "log");
+                });
+                ui.end_row();
+            });
+            if ui.button("スイープを追加").clicked() {
+                add = true;
+            }
+        });
+        if add {
+            let t = &self.tools;
+            let (sim, param, a, b, n, ty) = (t.s_sim.clone(), t.s_param.clone(), t.s_start.clone(), t.s_stop.clone(), t.s_points.clone(), ["lin", "log"][t.s_type]);
+            self.doc.checkpoint();
+            match self.doc.add_parameter_sweep(&sim, &param, &a, &b, &n, ty, None) {
+                Ok(n) => {
+                    self.status = format!("{n} を追加しました");
+                    self.changed();
+                }
+                Err(e) => self.status = e,
+            }
+        }
+        self.tools.sweep_open = open;
+
+        // ---------- tuning
+        let mut open = self.tools.tune_open;
+        let mut apply: Option<usize> = None;
+        let mut remove: Option<usize> = None;
+        egui::Window::new("チューニング").open(&mut open).default_width(380.0).show(ctx, |ui| {
+            ui.small("部品を選んで「追加」→ スライダーを動かすと値を書き換えて再シミュレーションします");
+            if ui.add_enabled(self.sel.len() == 1, egui::Button::new("選択中の部品の主な値を追加")).clicked() {
+                let ci = self.sel[0];
+                let c = &self.doc.sch.components[ci];
+                if let Some(v) = c.props.first().and_then(|p| crate::rftools::parse_value(&p.value)) {
+                    let unit: String = c.props[0].value.trim_start_matches(|ch: char| ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == '+' || ch == 'e' || ch == 'E').trim().trim_start_matches(['f', 'p', 'n', 'u', 'µ', 'm', 'k', 'M', 'G', 'T']).trim().to_string();
+                    self.tools.tunes.push(Tune { comp: c.name.clone(), prop: 0, unit, value: v, min: v / 10.0, max: v * 10.0 });
+                } else {
+                    self.status = "数値の値を持つ部品を選んでください".into();
+                }
+            }
+            ui.checkbox(&mut self.tools.tune_auto, "値を変えたら自動でシミュレーション");
+            for (k, t) in self.tools.tunes.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{} = {}", t.comp, crate::rftools::format_value(t.value, &t.unit)));
+                    if ui.small_button("✖").clicked() {
+                        remove = Some(k);
+                    }
+                });
+                let r = ui.add(egui::Slider::new(&mut t.value, t.min..=t.max).logarithmic(true).show_value(false));
+                if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                    apply = Some(k);
+                }
+            }
+        });
+        if let Some(k) = remove {
+            self.tools.tunes.remove(k);
+        }
+        if let Some(k) = apply {
+            let (comp, prop) = (self.tools.tunes[k].comp.clone(), self.tools.tunes[k].prop);
+            let v = crate::rftools::format_value(self.tools.tunes[k].value, &self.tools.tunes[k].unit);
+            if let Some(ci) = self.doc.sch.component_index(&comp) {
+                self.doc.checkpoint();
+                self.doc.sch.components[ci].props[prop].value = v.clone();
+                self.changed();
+                self.status = format!("{comp} = {v}");
+                if self.tools.tune_auto && self.sim_rx.is_none() {
+                    self.run_sim();
+                }
+            }
+        }
+        self.tools.tune_open = open;
     }
 
     // ------------------------------------------------------------------ canvas
@@ -966,7 +1703,7 @@ impl App {
             Tool::Place(t) => {
                 if let Some((px, py)) = pointer {
                     let (x, y) = (snap(px.round() as i32), snap(py.round() as i32));
-                    if let Ok(mut c) = library::new_component(&t, "?", x, y) {
+                    if let Ok(mut c) = spec_component(&t, x, y) {
                         c.rotate = self.place_rot;
                         let pl = library::place(&c, None);
                         let mut ghost = Vec::new();
@@ -977,7 +1714,16 @@ impl App {
                     }
                     if resp.clicked() {
                         self.doc.checkpoint();
-                        match self.doc.add_component(&t, None, x, y, Some(self.place_rot), None, &Default::default()) {
+                        let (typ, props) = match t.strip_prefix("Lib:").and_then(|r| r.split_once('/')) {
+                            Some((l, c)) => {
+                                let mut m = serde_json::Map::new();
+                                m.insert("Lib".into(), serde_json::json!(l));
+                                m.insert("Comp".into(), serde_json::json!(c));
+                                ("Lib".to_string(), m)
+                            }
+                            None => (t.clone(), serde_json::Map::new()),
+                        };
+                        match self.doc.add_component(&typ, None, x, y, Some(self.place_rot), None, &props) {
                             Ok(n) => {
                                 self.status = format!("{n} を配置");
                                 self.changed();
@@ -1046,6 +1792,55 @@ impl App {
                     self.autowire_first = None;
                 }
             }
+            Tool::Paint(kind) => {
+                if let Some((px, py)) = pointer {
+                    let cur = (snap(px.round() as i32), snap(py.round() as i32));
+                    if kind == "text" {
+                        if resp.clicked() {
+                            self.text_prompt = Some((cur, String::new(), None));
+                        }
+                    } else {
+                        if resp.drag_started_by(egui::PointerButton::Primary) {
+                            let press = resp.ctx.input(|i| i.pointer.press_origin()).unwrap_or(hover.unwrap());
+                            self.paint_start = Some(self.snapped(canvas, press));
+                        }
+                        if let Some(st) = self.paint_start {
+                            let a = self.to_screen(canvas, st.0 as f64, st.1 as f64);
+                            let b = self.to_screen(canvas, cur.0 as f64, cur.1 as f64);
+                            let s = Stroke::new(1.5, Color32::from_rgb(0, 120, 255));
+                            match kind.as_str() {
+                                "rect" => {
+                                    painter.rect_stroke(Rect::from_two_pos(a, b), 0.0, s, egui::StrokeKind::Inside);
+                                }
+                                "ellipse" => {
+                                    let r = Rect::from_two_pos(a, b);
+                                    painter.add(egui::Shape::ellipse_stroke(r.center(), r.size() / 2.0, s));
+                                }
+                                _ => {
+                                    painter.line_segment([a, b], s);
+                                }
+                            }
+                            if resp.drag_stopped() {
+                                self.paint_start = None;
+                                let (x, y, w, h) = match kind.as_str() {
+                                    "rect" | "ellipse" => (st.0.min(cur.0), st.1.min(cur.1), (cur.0 - st.0).abs(), (cur.1 - st.1).abs()),
+                                    _ => (st.0, st.1, cur.0 - st.0, cur.1 - st.1),
+                                };
+                                if w != 0 || h != 0 {
+                                    if let Ok(line) = crate::edit::make_painting(&kind, x, y, w, h, "#000080", 2, "", 12, false) {
+                                        self.doc.checkpoint();
+                                        self.doc.sch.paintings.push(format!("  {line}"));
+                                        self.changed();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if resp.secondary_clicked() {
+                    self.tool = Tool::Select;
+                }
+            }
             Tool::Label => {
                 if let Some((px, py)) = pointer {
                     if resp.clicked() {
@@ -1083,16 +1878,47 @@ impl App {
 
     fn select_tool(&mut self, resp: &egui::Response, canvas: Rect, painter: &egui::Painter, pointer: Option<(f64, f64)>) {
         let primary_down = resp.ctx.input(|i| i.pointer.primary_down());
+        if resp.double_clicked() {
+            if let Some((px, py)) = pointer {
+                if let Some(pi) = crate::edit::painting_at(&self.doc, px, py) {
+                    let line = &self.doc.sch.paintings[pi];
+                    if line.trim_start().starts_with("<Text") {
+                        let t = crate::schematic::painting_tokens(line);
+                        let cur = t.get(6).map(|s| crate::schematic::unquote(s).replace("\\n", "\n")).unwrap_or_default();
+                        self.text_prompt = Some(((0, 0), cur, Some(pi)));
+                    }
+                }
+            }
+        }
+        // selected paintings: dashed outline
+        for &k in &self.sel_paint {
+            if let Some(b) = self.doc.sch.paintings.get(k).and_then(|p| crate::edit::painting_bbox(p)) {
+                let r = Rect::from_two_pos(self.to_screen(canvas, b[0] - 3.0, b[1] - 3.0), self.to_screen(canvas, b[2] + 3.0, b[3] + 3.0));
+                painter.rect_stroke(r, 2.0, Stroke::new(1.5, Color32::from_rgb(255, 120, 0)), egui::StrokeKind::Outside);
+            }
+        }
         if resp.drag_started_by(egui::PointerButton::Primary) {
             if let Some(press) = resp.ctx.input(|i| i.pointer.press_origin()) {
                 let (px, py) = self.to_sch_f(canvas, press);
-                if let Some(ci) = self.comp_at(px, py) {
+                if let Some(wi) = crate::edit::wire_label_at(&self.doc, px, py) {
+                    let w = &self.doc.sch.wires[wi];
+                    self.grab = Some(Grab::WireLabel { wire: wi, orig: (w.lx, w.ly), start: (px, py) });
+                } else if let Some(ci) = crate::edit::comp_label_at(&self.doc, px, py).filter(|ci| self.sel.contains(ci) || self.comp_at(px, py).is_none()) {
+                    let c = &self.doc.sch.components[ci];
+                    self.grab = Some(Grab::CompLabel { comp: ci, orig: (c.tx, c.ty), start: (px, py) });
+                } else if let Some(ci) = self.comp_at(px, py) {
                     if !self.sel.contains(&ci) {
                         self.sel = vec![ci];
                         self.sel_wires.clear();
                     }
                     let orig = self.sel.iter().map(|&i| (i, self.doc.sch.components[i].x, self.doc.sch.components[i].y)).collect();
                     self.drag = Some(Drag { start: (px.round() as i32, py.round() as i32), orig, moved: false });
+                } else if let Some(pi) = crate::edit::painting_at(&self.doc, px, py) {
+                    if !self.sel_paint.contains(&pi) {
+                        self.sel_paint = vec![pi];
+                    }
+                    let orig = self.sel_paint.iter().map(|&k| (k, self.doc.sch.paintings[k].clone())).collect();
+                    self.grab = Some(Grab::Paintings { orig, start: (px.round() as i32, py.round() as i32), moved: (0, 0) });
                 } else {
                     self.box_start = Some(press);
                 }
@@ -1116,6 +1942,33 @@ impl App {
                 }
             }
         }
+        if let (Some(g), Some((px, py))) = (&mut self.grab, pointer) {
+            if primary_down {
+                match g {
+                    Grab::WireLabel { wire, orig, start } => {
+                        let w = &mut self.doc.sch.wires[*wire];
+                        w.lx = orig.0 + (px - start.0).round() as i32;
+                        w.ly = orig.1 + (py - start.1).round() as i32;
+                    }
+                    Grab::CompLabel { comp, orig, start } => {
+                        let c = &mut self.doc.sch.components[*comp];
+                        c.tx = orig.0 + (px - start.0).round() as i32;
+                        c.ty = orig.1 + (py - start.1).round() as i32;
+                    }
+                    Grab::Paintings { orig, start, moved } => {
+                        let d = (snap(px.round() as i32 - start.0), snap(py.round() as i32 - start.1));
+                        if d != *moved {
+                            *moved = d;
+                            for (k, line) in orig.iter() {
+                                self.doc.sch.paintings[*k] = crate::edit::translate_painting(line, d.0, d.1);
+                            }
+                        }
+                    }
+                }
+                self.conn = self.doc.conn();
+                self.gen += 1;
+            }
+        }
         if let Some(b) = self.box_start {
             if let Some(h) = resp.hover_pos().or(resp.interact_pointer_pos()) {
                 let r = Rect::from_two_pos(b, h);
@@ -1124,6 +1977,28 @@ impl App {
             }
         }
         if resp.drag_stopped() {
+            if let Some(g) = self.grab.take() {
+                // put the original back, checkpoint, re-apply: one undo step
+                let snapshot = self.doc.sch.clone();
+                match &g {
+                    Grab::WireLabel { wire, orig, .. } => {
+                        self.doc.sch.wires[*wire].lx = orig.0;
+                        self.doc.sch.wires[*wire].ly = orig.1;
+                    }
+                    Grab::CompLabel { comp, orig, .. } => {
+                        self.doc.sch.components[*comp].tx = orig.0;
+                        self.doc.sch.components[*comp].ty = orig.1;
+                    }
+                    Grab::Paintings { orig, .. } => {
+                        for (k, line) in orig {
+                            self.doc.sch.paintings[*k] = line.clone();
+                        }
+                    }
+                }
+                self.doc.checkpoint();
+                self.doc.sch = snapshot;
+                self.changed();
+            }
             if let Some(d) = self.drag.take() {
                 if d.moved {
                     // restore, then apply as one undoable move (+ re-route)
@@ -1148,6 +2023,9 @@ impl App {
                     let (x1, y1) = self.to_sch_f(canvas, h);
                     let r = [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)];
                     self.sel = self.conn.placed.iter().enumerate().filter(|(_, p)| p.bbox[0] < r[2] && p.bbox[2] > r[0] && p.bbox[1] < r[3] && p.bbox[3] > r[1]).map(|(i, _)| i).collect();
+                    self.sel_paint = self.doc.sch.paintings.iter().enumerate().filter(|(_, p)| {
+                        crate::edit::painting_bbox(p).map(|b| b[0] >= r[0] && b[2] <= r[2] && b[1] >= r[1] && b[3] <= r[3]).unwrap_or(false)
+                    }).map(|(i, _)| i).collect();
                     self.sel_wires = self.doc.sch.wires.iter().enumerate().filter(|(_, w)| {
                         let (a, bb) = ((w.x1.min(w.x2)) as f64, (w.x1.max(w.x2)) as f64);
                         let (c, dd) = ((w.y1.min(w.y2)) as f64, (w.y1.max(w.y2)) as f64);
@@ -1170,15 +2048,25 @@ impl App {
                         self.sel = vec![ci];
                         self.sel_wires.clear();
                     }
+                    self.sel_paint.clear();
                 } else if let Some(wi) = self.wire_at(px, py) {
                     if !shift {
                         self.sel.clear();
                         self.sel_wires.clear();
+                        self.sel_paint.clear();
                     }
                     self.sel_wires.push(wi);
+                } else if let Some(pi) = crate::edit::painting_at(&self.doc, px, py) {
+                    if !shift {
+                        self.sel.clear();
+                        self.sel_wires.clear();
+                        self.sel_paint.clear();
+                    }
+                    self.sel_paint.push(pi);
                 } else {
                     self.sel.clear();
                     self.sel_wires.clear();
+                    self.sel_paint.clear();
                 }
             }
         }
@@ -1201,6 +2089,25 @@ impl App {
             if self.doc.redo() {
                 self.changed();
             }
+            return;
+        }
+        let events = ctx.input(|i| i.events.clone());
+        for ev in events {
+            match ev {
+                egui::Event::Copy => self.copy_selection(ctx, false),
+                egui::Event::Cut => self.copy_selection(ctx, true),
+                egui::Event::Paste(text) => self.paste(&text),
+                _ => {}
+            }
+        }
+        if ctrl && pressed(egui::Key::D) {
+            self.duplicate_selection();
+            return;
+        }
+        if ctrl && pressed(egui::Key::A) {
+            self.sel = (0..self.doc.sch.components.len()).collect();
+            self.sel_wires = (0..self.doc.sch.wires.len()).collect();
+            self.sel_paint = (0..self.doc.sch.paintings.len()).collect();
             return;
         }
         if ctrl && pressed(egui::Key::S) {
@@ -1232,6 +2139,12 @@ impl App {
         }
         if pressed(egui::Key::M) {
             self.mirror_selected();
+        }
+        if pressed(egui::Key::Y) {
+            self.mirror_y_selected();
+        }
+        if pressed(egui::Key::T) {
+            self.tool = Tool::Paint("text".into());
         }
         if pressed(egui::Key::Delete) || pressed(egui::Key::Backspace) {
             self.delete_selected();
@@ -1337,6 +2250,36 @@ impl eframe::App for App {
             self.canvas(ui);
         });
         self.sim_window(ctx);
+        self.tool_windows(ctx);
+        if let Some((pos, mut text, editing)) = self.text_prompt.take() {
+            let mut done = false;
+            let mut cancel = false;
+            egui::Window::new("テキスト").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+                ui.add(egui::TextEdit::multiline(&mut text).desired_rows(3));
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        done = true;
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+            if done && !text.trim().is_empty() {
+                self.doc.checkpoint();
+                match editing {
+                    Some(k) => self.doc.sch.paintings[k] = crate::edit::set_painting_text(&self.doc.sch.paintings[k], &text),
+                    None => {
+                        if let Ok(l) = crate::edit::make_painting("text", pos.0, pos.1, 0, 0, "#000000", 1, &text, 12, false) {
+                            self.doc.sch.paintings.push(format!("  {l}"));
+                        }
+                    }
+                }
+                self.changed();
+            } else if !done && !cancel {
+                self.text_prompt = Some((pos, text, editing));
+            }
+        }
         if let Some((t, mut text)) = self.label_prompt.take() {
             let mut done = false;
             let mut cancel = false;

@@ -220,6 +220,22 @@ fn kind_from_title(t: &str) -> &'static str {
     }
 }
 
+/// ngspice writes unit *names* ("frequency", "voltage"); show SI symbols instead.
+fn si_unit(u: &str) -> String {
+    match u.split_whitespace().next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "frequency" | "hertz" => "Hz".into(),
+        "time" => "s".into(),
+        "voltage" => "V".into(),
+        "current" => "A".into(),
+        "decibel" => "dB".into(),
+        "degree" | "degrees" => "°".into(),
+        "radian" | "radians" => "rad".into(),
+        "impedance" => "Ω".into(),
+        "notype" | "" => String::new(),
+        _ => u.to_string(),
+    }
+}
+
 const REAL_UNITS: [&str; 8] = ["frequency", "time", "decibel", "degree", "degrees", "radian", "radians", "hertz"];
 
 pub fn parse_raw(data: &[u8], name: &str) -> Vec<Plot> {
@@ -324,7 +340,7 @@ pub fn parse_raw(data: &[u8], name: &str) -> Vec<Plot> {
         let title = get("Plotname");
         let mut vectors = Vec::new();
         for (j, (vn, unit)) in vars.iter().enumerate() {
-            let mut v = Vector { name: vn.clone(), unit: unit.clone(), re: std::mem::take(&mut re[j]), im: None };
+            let mut v = Vector { name: vn.clone(), unit: si_unit(unit), re: std::mem::take(&mut re[j]), im: None };
             if complex {
                 let imv = std::mem::take(&mut im[j]);
                 let maxre = v.re.iter().map(|x| x.abs()).fold(0.0, f64::max) + 1e-300;

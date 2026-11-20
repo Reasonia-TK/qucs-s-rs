@@ -265,20 +265,18 @@ impl Grid {
 
     /// Route from `start` (leaving in `start_dir` if given) to any of `targets`.
     /// Returns the poly-line (schematic units) including both end points.
-    pub fn route(
-        &self,
-        start: (i32, i32),
-        start_dir: Option<(i32, i32)>,
-        targets: &[Target],
-        net: i32,
-    ) -> Option<Vec<(i32, i32)>> {
-        if start.0 % G != 0 || start.1 % G != 0 {
+    /// Route from any of several start points (e.g. every point of an already wired
+    /// group); each start may require a first-move direction.
+    pub fn route_multi(&self, starts: &[((i32, i32), Option<(i32, i32)>)], targets: &[Target], net: i32) -> Option<Vec<(i32, i32)>> {
+        let starts: Vec<((i32, i32), Option<(i32, i32)>)> = starts
+            .iter()
+            .filter(|(p, _)| p.0 % G == 0 && p.1 % G == 0 && self.inside(p.0 / G, p.1 / G))
+            .map(|&((x, y), d)| ((x / G, y / G), d))
+            .collect();
+        if starts.is_empty() {
             return None;
         }
-        let (sx, sy) = (start.0 / G, start.1 / G);
-        if !self.inside(sx, sy) {
-            return None;
-        }
+        let start_cells: Vec<(i32, i32)> = starts.iter().map(|s| s.0).collect();
         let n = (self.w * self.h) as usize;
         // target lookup
         let mut tmap: Vec<Option<Arrive>> = vec![None; n];
@@ -288,7 +286,7 @@ impl Grid {
                 continue;
             }
             let (gx, gy) = (t.x / G, t.y / G);
-            if !self.inside(gx, gy) || (gx, gy) == (sx, sy) {
+            if !self.inside(gx, gy) || start_cells.contains(&(gx, gy)) {
                 continue;
             }
             let i = self.idx(gx, gy);
@@ -310,19 +308,21 @@ impl Grid {
         let mut best = vec![u32::MAX; ns];
         let mut parent = vec![u32::MAX; ns];
         let mut heap = BinaryHeap::new();
-        let start_dirs: Vec<usize> = match start_dir.and_then(dir_index) {
-            Some(d) => vec![d],
-            None => (0..4).collect(),
-        };
         let start_state = u32::MAX - 1;
-        for d in start_dirs {
-            if let Some((ni, cost)) = self.step_cost(sx, sy, d, None, net, &tmap) {
-                let st = ni * 4 + d;
-                if cost < best[st] {
-                    best[st] = cost;
-                    parent[st] = start_state;
-                    let (gx, gy) = (sx + DIRS[d].0, sy + DIRS[d].1);
-                    heap.push(Reverse((cost + hfn(gx, gy), cost, st as u32)));
+        for &((sx, sy), sd) in &starts {
+            let start_dirs: Vec<usize> = match sd.and_then(dir_index) {
+                Some(d) => vec![d],
+                None => (0..4).collect(),
+            };
+            for d in start_dirs {
+                if let Some((ni, cost)) = self.step_cost(sx, sy, d, None, net, &tmap) {
+                    let st = ni * 4 + d;
+                    if cost < best[st] {
+                        best[st] = cost;
+                        parent[st] = start_state;
+                        let (gx, gy) = (sx + DIRS[d].0, sy + DIRS[d].1);
+                        heap.push(Reverse((cost + hfn(gx, gy), cost, st as u32)));
+                    }
                 }
             }
         }
@@ -388,11 +388,14 @@ impl Grid {
             cells.push(cell);
             let p = parent[st];
             if p == start_state {
+                // the start cell is one step back along the first move
+                let (gx, gy) = ((cell as i32 % self.w) + self.gx0, (cell as i32 / self.w) + self.gy0);
+                let (dx, dy) = DIRS[st % 4];
+                cells.push(self.idx(gx - dx, gy - dy));
                 break;
             }
             st = p as usize;
         }
-        cells.push(self.idx(sx, sy));
         cells.reverse();
         let pts: Vec<(i32, i32)> = cells
             .iter()

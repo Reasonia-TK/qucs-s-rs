@@ -55,7 +55,11 @@ cargo build --release
 * 左: 部品パレット（検索可）、右: プロパティ編集、上: ツールバー
 * 操作: ホイールでズーム、中／右ドラッグでパン、ドラッグで移動（移動後に自動再配線）、`R` 回転、`M` ミラー、`Del` 削除、`W` 手配線、`A` 自動配線（ピンを 2 つクリック）、`L` ネットラベル、`F` 全体表示、`Ctrl+Z / Ctrl+Y / Ctrl+S`
 * 「自動保存 (AI同期)」が ON のとき、編集は即座に .sch に保存され、MCP 側（AI）は次のツール呼び出しで自動的に読み直します。逆に AI の編集はエディタに即時反映されます
-* ⟲ 全再配線 / ✨ 整頓 / 🔍 チェック / ▶ シミュレーション（結果グラフ表示）
+* ⟲ 全再配線 / ✨ 整頓 / 🔍 チェック / ▶ シミュレーション
+* 部品パレットは「部品」（220 種の組み込み部品）と「ライブラリ」（Qucs-S 付属の 70 ライブラリ・約 4,200 の実部品）のタブ。どちらもシンボルのアイコン付き
+* 編集: `Ctrl+C / X / V`（Qucs のクリップボード形式なので Qucs-S との間でもコピーできる）、`Ctrl+D` 複製、`Ctrl+A` 全選択、`Y` Y 軸ミラー、`T` テキスト、図形（線・矩形・楕円・矢印）、整列・等間隔配置、ラベルや図形のドラッグ移動、選択肢のあるプロパティはプルダウン、PNG / SVG 書き出し
+* 結果ウィンドウ: 直交（AC は dB＋位相）・極座標・スミスチャート・表。グラフをクリックするとマーカーが付き、各トレースの値を表示。パラメータスイープは全ステップを重ね描き。回路図に埋め込まれた Qucs-S のダイアグラムも枠と系列名を表示
+* ⚙ ツール: フィルタ設計（Butterworth / Chebyshev / Bessel、LP / HP / BP / BS、テスト回路付きで配置）、減衰器設計（π / T / ブリッジ T）、伝送線路計算（マイクロストリップの解析・合成、同軸）、パラメータスイープ、チューニング（スライダーで値を変えると自動で再シミュレーション）
 
 ### MCP サーバー（Claude Code）
 
@@ -86,11 +90,13 @@ Claude Desktop など:
 
 | 分類 | ツール |
 |---|---|
-| ファイル | `new_schematic` `open_schematic` `save_schematic` `get_schematic` |
-| 部品 | `list_component_types` `get_component_type` `add_components`（`align` でピン基準配置） `update_component` `move_components`（自動再配線） `delete_components` |
+| ファイル | `new_schematic` `open_schematic` `save_schematic` `get_schematic` `export_image`（PNG / SVG） |
+| 部品 | `list_component_types` `get_component_type` `search_library`（Qucs-S ライブラリの実部品） `add_components`（`type:"Lib"` + `lib`/`comp` で実部品、`align` でピン基準配置） `update_component`（`mirror_y` も可） `move_components`（自動再配線） `duplicate_components` `align_components` `delete_components` |
 | 配線 | `connect`（複数ネットを一括、ラベル付与、ピンスワップ、改善パス） `add_wire` `delete_wires` `add_net_label` `reroute` `tidy` |
+| 図形 | `add_painting`（線・矩形・楕円・矢印・テキスト） `delete_paintings` |
 | 見る | `snapshot`（PNG。グリッド＋座標ルーラー、ネット色分けと名前、ピン名、問題マーカー、ハイライト、領域ズーム、`clean` で報告用） `check_layout` |
-| シミュレーション | `add_simulation` `get_netlist` `run_simulation` `get_results`（指定点の補間値・表） `plot_results` |
+| シミュレーション | `add_simulation` `add_parameter_sweep` `get_netlist` `run_simulation` `get_results`（指定点の補間値・表） `plot_results`（直交・極座標・スミス・表、マーカー値を数値でも返す） |
+| 設計ツール | `design_filter`（LC フィルタ合成→配置・配線、テスト回路付き） `design_attenuator` `calc_transmission_line`（マイクロストリップ / 同軸） |
 | エディタ連携 | `open_gui`（ユーザーにライブ表示） `get_gui_state`（ユーザーが選択中の部品・表示範囲） |
 
 座標は Qucs と同じ（x 右、**y 下**、10 グリッド）。端子指定は `"R1.1"` `"V1.+"` `"OP1.OUT"`、座標 `"[x,y]"`、ネット `"net:vcc"`。
@@ -119,7 +125,12 @@ src/
   gui.rs        エディタ (egui)
   mcp.rs        MCP サーバー (stdio JSON-RPC)
   sim.rs        qucs-s でネットリスト → ngspice → raw 解析
-  plot.rs       結果グラフ
+  diagram.rs    結果ダイアグラム（直交・極座標・スミス・表、マーカー）
+  qlib.rs       Qucs-S ライブラリ（.lib）とサブ回路の <Symbol> 読み込み
+  edit.rs       クリップボード、複製、整列、図形
+  rftools.rs    フィルタ・減衰器・伝送線路の計算
+  synth.rs      計算結果を回路図に配置・配線（テスト回路付き）
+  plot.rs       数値の表記
 data/
   components.json  プロパティ・ピン（qucs-s から実測）
   symbols.json     シンボル図形（tools/extract_symbols.py が Qucs-S の C++ から生成）
@@ -140,6 +151,7 @@ python tools\extract_symbols.py ..\qucs_s_src_ref\qucs_s data\components.json da
 cargo test                                # パーサ往復、ピン位置、接続解析、ルーター
 python tests\e2e_mcp.py                   # MCP クライアントとして回路作成〜シミュレーションまで
 python tests\live_sync.py                 # エディタを開いたまま MCP で編集し、追従を確認
+python tests\e2e_features.py             # ライブラリ部品・フィルタ合成・マーカー・スイープ・編集ツール
 ```
 
 ## ライセンス

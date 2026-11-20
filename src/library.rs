@@ -308,6 +308,9 @@ fn translate(p: &mut Prim, dx: f64, dy: f64) {
 
 /// Property name for display (`R=10k`).
 pub fn prop_name(c: &Component, i: usize) -> String {
+    if let Some(n) = crate::qlib::param_name(c, i, None) {
+        return n;
+    }
     let lib = lib();
     if let Some(info) = lib.info(&c.typ) {
         if let Some(p) = info.props.get(i) {
@@ -401,7 +404,16 @@ pub fn place(c: &Component, sch_dir: Option<&Path>) -> Placed {
     let lib = lib();
     let def = lib.symbols.get(&c.typ);
     let mut kind = SymbolKind::Normal;
+    let ext = match c.typ.as_str() {
+        "Lib" => crate::qlib::lib_symbol(c),
+        "Sub" => crate::qlib::sub_symbol(c, sch_dir),
+        _ => None,
+    };
     let (mut prims, mut ports, mut bbox, rotated) = match def {
+        _ if ext.is_some() => {
+            let s = &ext.as_ref().unwrap().shape;
+            (s.prims.clone(), s.ports.clone(), s.bbox, 0)
+        }
         Some(d) if !d.shape.prims.is_empty() => {
             let s = pick_shape(d, c);
             (s.prims.clone(), s.ports.clone(), s.bbox, s.rotated)
@@ -474,7 +486,10 @@ pub fn place(c: &Component, sch_dir: Option<&Path>) -> Placed {
     for p in prims.iter_mut() {
         translate(p, cx, cy);
     }
-    let names = def.map(|d| d.pin_names.clone()).unwrap_or_default();
+    let names = match &ext {
+        Some(e) => e.pin_names.clone(),
+        None => def.map(|d| d.pin_names.clone()).unwrap_or_default(),
+    };
     let body = [bbox[0] + cx, bbox[1] + cy, bbox[2] + cx, bbox[3] + cy];
     let pins: Vec<PlacedPin> = ports
         .iter()

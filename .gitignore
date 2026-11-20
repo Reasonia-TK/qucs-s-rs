@@ -4,3 +4,4 @@ snapshots/
 qucs_work/
 __pycache__/
 *.sch.tmp
+.claude/

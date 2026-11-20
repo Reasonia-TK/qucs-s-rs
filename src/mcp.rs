@@ -34,7 +34,9 @@ fn tools() -> Vec<Value> {
     let comp_item = json!({
         "type": "object",
         "properties": {
-            "type": {"type": "string", "description": "component type, e.g. R, C, L, Vdc, Vac, Vpulse, GND, OpAmp, Diode, NPN_SPICE ... (list_component_types)"},
+            "type": {"type": "string", "description": "component type, e.g. R, C, L, Vdc, Vac, Vpulse, GND, OpAmp, Diode, _BJT ... (list_component_types), or \"Lib\" for a library part"},
+            "lib": {"type": "string", "description": "for type Lib: library name, e.g. \"OpAmps\" (search_library)"},
+            "comp": {"type": "string", "description": "for type Lib: component name in the library, e.g. \"LM358\""},
             "name": {"type": "string"},
             "x": {"type": "integer"}, "y": {"type": "integer"},
             "rotate": {"type": "integer", "description": "Qucs rotation count 0..3 (each 90° counter-clockwise). Default = the type's default orientation (sources are vertical = 1)."},
@@ -51,12 +53,22 @@ fn tools() -> Vec<Value> {
         tool("save_schematic", "Save (optionally to a new path). Edits are saved automatically anyway.", json!({"path": {"type": "string"}}), &[]),
         tool("get_schematic", "Components (with absolute pin positions and nets), wires and nets of the open schematic.", json!({"include_wires": {"type": "boolean"}}), &[]),
         tool("list_component_types", "Search the component library (220 Qucs-S types).", json!({"query": {"type": "string"}, "category": {"type": "string"}}), &[]),
+        tool("search_library", "Search the Qucs-S component libraries (real parts: op-amps, transistors, diodes, regulators, transformers, ...). Returns lib/comp names, description, pins and parameters; place with add_components {type:\"Lib\", lib, comp}.",
+            json!({"query": {"type": "string", "description": "words to match, e.g. \"lm358\", \"zener 5v\", \"mosfet irf\""}, "lib": {"type": "string", "description": "restrict to one library"}, "limit": {"type": "integer"}}), &[]),
         tool("get_component_type", "Properties (name/default/description), pins and symbol size of a component type.", json!({"type": {"type": "string"}}), &["type"]),
         tool("add_components", "Place components. Returns their pins (absolute coordinates and lead direction) so you can plan wiring.", json!({"components": {"type": "array", "items": comp_item}}), &["components"]),
         tool("update_component", "Change properties, orientation, position or name of a component (wires are NOT moved; use move_components for that).",
-            json!({"name": {"type": "string"}, "props": {"type": "object"}, "rotate": {"type": "integer"}, "mirror": {"type": "boolean"}, "x": {"type": "integer"}, "y": {"type": "integer"}, "new_name": {"type": "string"}, "active": {"type": "integer", "description": "1 active, 0 off, 2 shorted"}, "label_offset": {"type": "array", "items": {"type": "integer"}, "description": "[tx, ty] text position relative to the component"}}), &["name"]),
+            json!({"name": {"type": "string"}, "props": {"type": "object"}, "rotate": {"type": "integer"}, "mirror": {"type": "boolean"}, "x": {"type": "integer"}, "y": {"type": "integer"}, "new_name": {"type": "string"}, "mirror_y": {"type": "boolean", "description": "mirror about the Y axis (left-right)"}, "active": {"type": "integer", "description": "1 active, 0 off, 2 shorted"}, "label_offset": {"type": "array", "items": {"type": "integer"}, "description": "[tx, ty] text position relative to the component"}}), &["name"]),
         tool("move_components", "Move components (absolute x/y or relative dx/dy) and re-route the wires attached to them.",
             json!({"moves": {"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string"}, "x": {"type": "integer"}, "y": {"type": "integer"}, "dx": {"type": "integer"}, "dy": {"type": "integer"}}, "required": ["name"]}}, "reroute": {"type": "boolean", "description": "default true"}}), &["moves"]),
+        tool("duplicate_components", "Copy components (and the wires between them) with an offset; names are renumbered. Returns the new names.",
+            json!({"names": {"type": "array", "items": {"type": "string"}}, "dx": {"type": "integer"}, "dy": {"type": "integer"}}), &["names"]),
+        tool("align_components", "Align or distribute components: mode left|right|top|bottom|hcenter|vcenter|distribute_h|distribute_v. Wires are re-routed.",
+            json!({"names": {"type": "array", "items": {"type": "string"}}, "mode": {"type": "string"}}), &["names", "mode"]),
+        tool("add_painting", "Add a drawing: kind line|rect|ellipse|arrow|text. line/arrow: (x,y)->(x+w,y+h); rect/ellipse: box; text: text at (x,y).",
+            json!({"kind": {"type": "string"}, "x": {"type": "integer"}, "y": {"type": "integer"}, "w": {"type": "integer"}, "h": {"type": "integer"}, "text": {"type": "string"}, "size": {"type": "integer"}, "color": {"type": "string", "description": "#rrggbb"}, "width": {"type": "integer"}, "filled": {"type": "boolean"}}), &["kind", "x", "y"]),
+        tool("delete_paintings", "Delete drawings by index (get_schematic lists them) or all.", json!({"indices": {"type": "array", "items": {"type": "integer"}}, "all": {"type": "boolean"}}), &[]),
+        tool("export_image", "Write the schematic as PNG or SVG (report style, no overlays) to a file.", json!({"path": {"type": "string"}, "scale": {"type": "number", "description": "pixels per unit, default 2"}}), &["path"]),
         tool("delete_components", "Delete components (and optionally the wires of nets left without pins).", json!({"names": {"type": "array", "items": {"type": "string"}}, "delete_dangling_wires": {"type": "boolean"}}), &["names"]),
         tool("connect", "Auto-route wires. Each entry of `nets` is a list of terminals that become one net (\"R1.2\", \"[x,y]\", \"net:name\"). Optional labels give the net a name.",
             json!({"nets": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}}, "labels": {"type": "array", "items": {"type": "string"}, "description": "net label per entry of nets (\"\" for none)"},
@@ -80,10 +92,23 @@ fn tools() -> Vec<Value> {
             }), &[]),
         tool("add_simulation", "Add a simulation block: kind tr|ac|dc|sweep|noise|fourier|... with properties, e.g. {\"kind\":\"tr\",\"props\":{\"Stop\":\"3 ms\",\"Points\":\"601\"}} or ac {\"Type\":\"log\",\"Start\":\"10 Hz\",\"Stop\":\"10 MHz\",\"Points\":\"301\"}.",
             json!({"kind": {"type": "string"}, "props": {"type": "object"}, "x": {"type": "integer"}, "y": {"type": "integer"}}), &["kind"]),
+        tool("add_parameter_sweep", "Sweep a component value (param = component name, e.g. \"R1\", \"C2\", \"V1\") or a variable (created in a .PARAM block if missing; use {name} in component values) over an existing analysis (sim = \"TR1\", \"AC1\", \"DC1\"...). Results come back as one analysis per step (plot_results overlays them).",
+            json!({"sim": {"type": "string"}, "param": {"type": "string"}, "start": {"type": "string"}, "stop": {"type": "string"}, "points": {"type": "string"}, "type": {"type": "string", "description": "lin (default) | log | list"}, "default": {"type": "string", "description": "value for a newly created variable"}}), &["sim", "param", "start", "stop"]),
         tool("get_netlist", "The ngspice netlist generated by Qucs-S for the current schematic.", json!({}), &[]),
         tool("run_simulation", "Run ngspice (netlist by Qucs-S). Returns a summary of every analysis.", json!({"timeout_s": {"type": "integer"}}), &[]),
         tool("get_results", "Values of result vectors: summary, values at given x positions, or a decimated table.", json!({"analysis": {"type": "string"}, "vectors": {"type": "array", "items": {"type": "string"}}, "at": {"type": "array", "items": {"type": "number"}}, "points": {"type": "integer", "description": "table rows (decimated)"}}), &[]),
-        tool("plot_results", "Plot vectors of an analysis (AC: dB + phase; sweeps: all steps) and return the PNG.", json!({"analysis": {"type": "string"}, "vectors": {"type": "array", "items": {"type": "string"}}, "db": {"type": "boolean"}}), &[]),
+        tool("plot_results", "Result diagram like Qucs-S: kind rect (default; AC shows dB + phase), polar, smith (reflection coefficients) or table. markers = x values (time / frequency) to read off: the values are returned as numbers too. Sweeps overlay all steps.",
+            json!({"analysis": {"type": "string"}, "vectors": {"type": "array", "items": {"type": "string"}}, "kind": {"type": "string", "description": "rect | polar | smith | table"},
+                   "markers": {"type": "array", "items": {"type": "number"}}, "db": {"type": "boolean"}, "phase": {"type": "boolean"}, "x_log": {"type": "boolean"}, "y_log": {"type": "boolean"},
+                   "x_range": {"type": "array", "items": {"type": "number"}}, "y_range": {"type": "array", "items": {"type": "number"}}, "z0": {"type": "number"}, "title": {"type": "string"}}), &[]),
+        tool("design_filter", "LC ladder filter synthesis (like qucs-sfilter) placed into the schematic and wired. response butterworth|chebyshev|bessel, class lowpass|highpass|bandpass|bandstop, order, f1 (corner / lower edge), f2 (upper edge), z0. test_bench=true adds source, load and an AC sweep.",
+            json!({"response": {"type": "string"}, "ripple_db": {"type": "number"}, "class": {"type": "string"}, "order": {"type": "integer"}, "f1": {"type": "string", "description": "e.g. \"10 MHz\""}, "f2": {"type": "string"}, "z0": {"type": "number"},
+                   "first_series": {"type": "boolean", "description": "T start (series element first) instead of PI"}, "x": {"type": "integer"}, "y": {"type": "integer"}, "place": {"type": "boolean", "description": "default true; false = only compute values"}, "test_bench": {"type": "boolean"}}), &["f1"]),
+        tool("design_attenuator", "Resistive attenuator (like qucs-sattenuator): topology pi|tee|bridged_tee, atten_db, z_in, z_out. Placed and wired unless place=false.",
+            json!({"topology": {"type": "string"}, "atten_db": {"type": "number"}, "z_in": {"type": "number"}, "z_out": {"type": "number"}, "x": {"type": "integer"}, "y": {"type": "integer"}, "place": {"type": "boolean"}, "test_bench": {"type": "boolean"}}), &["atten_db"]),
+        tool("calc_transmission_line", "Transmission line calculator (like qucs-strans). microstrip: er, h_mm, t_um, and w_mm (analyse) or z0 (synthesise width); freq for dispersion and lengths (electrical_deg -> length_mm, length_mm -> degrees). coax: er, d_inner_mm, d_outer_mm.",
+            json!({"kind": {"type": "string"}, "er": {"type": "number"}, "h_mm": {"type": "number"}, "t_um": {"type": "number"}, "w_mm": {"type": "number"}, "z0": {"type": "number"}, "freq": {"type": "string"},
+                   "length_mm": {"type": "number"}, "electrical_deg": {"type": "number"}, "d_inner_mm": {"type": "number"}, "d_outer_mm": {"type": "number"}}), &[]),
         tool("open_gui", "Open the live editor window for the current schematic (it follows every change made here).", json!({}), &[]),
         tool("get_gui_state", "What the user has selected / is looking at in the editor window.", json!({}), &[]),
     ]
@@ -210,6 +235,28 @@ impl Server {
                 }
                 Ok(vec![text(&json!({"count": out.len(), "types": out, "categories": if show_cats { json!(cats) } else { Value::Null }}))])
             }
+            "search_library" => {
+                let q = s(a, "query").unwrap_or("");
+                let lim = i(a, "limit").unwrap_or(40).clamp(1, 300) as usize;
+                let only = s(a, "lib");
+                let mut hits = crate::qlib::search(q, if only.is_some() { 100_000 } else { lim });
+                if let Some(l) = only {
+                    hits.retain(|h| h.0.name.eq_ignore_ascii_case(l));
+                    hits.truncate(lim);
+                }
+                let out: Vec<Value> = hits
+                    .iter()
+                    .map(|(l, c)| {
+                        let tmp = crate::qlib::new_lib_component(&l.name, &c.name, "X", 0, 0).ok();
+                        let pins = tmp.map(|t| library::place(&t, None).pins.iter().map(|p| json!({"pin": p.name, "x": p.x, "y": p.y, "dir": [p.dir.0, p.dir.1]})).collect::<Vec<_>>()).unwrap_or_default();
+                        json!({"lib": l.name, "comp": c.name, "description": c.description, "ngspice": l.ngspice_ok && (c.has_spice || c.has_qucs_model),
+                               "pins_at_origin": pins,
+                               "params": c.symbol.params.iter().map(|p| json!({"name": p.name, "default": p.default, "description": p.description})).collect::<Vec<_>>()})
+                    })
+                    .collect();
+                let libs: Vec<String> = if q.is_empty() && only.is_none() { crate::qlib::libraries().iter().map(|l| format!("{} ({})", l.name, l.comps.len())).collect() } else { vec![] };
+                Ok(vec![text(&json!({"count": out.len(), "parts": out, "libraries": libs, "library_dirs": crate::qlib::library_dirs().iter().map(|d| d.display().to_string()).collect::<Vec<_>>()}))])
+            }
             "get_component_type" => {
                 let t = s(a, "type").ok_or("type required")?;
                 let info = lib().info(t).ok_or_else(|| format!("unknown type '{t}'"))?;
@@ -230,7 +277,14 @@ impl Server {
                 d.checkpoint();
                 for it in &items {
                     let typ = s(it, "type").ok_or("each component needs a type")?;
-                    let props = it.get("props").and_then(|p| p.as_object()).cloned().unwrap_or_default();
+                    let mut props = it.get("props").and_then(|p| p.as_object()).cloned().unwrap_or_default();
+                    if typ == "Lib" {
+                        for (k, key) in [("lib", "Lib"), ("comp", "Comp")] {
+                            if let Some(v) = s(it, k) {
+                                props.insert(key.into(), json!(v));
+                            }
+                        }
+                    }
                     let (mut x, mut y) = (i(it, "x").unwrap_or(0), i(it, "y").unwrap_or(0));
                     let name = d.add_component(typ, s(it, "name"), x, y, i(it, "rotate"), b(it, "mirror"), &props)?;
                     if let Some(al) = it.get("align") {
@@ -277,6 +331,9 @@ impl Server {
                 if let Some(m) = b(a, "mirror") {
                     c.mirror = m as i32;
                 }
+                if b(a, "mirror_y").unwrap_or(false) {
+                    crate::edit::mirror_y(c);
+                }
                 if let Some(x) = i(a, "x") {
                     c.x = crate::doc::snap(x);
                 }
@@ -318,6 +375,88 @@ impl Server {
                 let r = d.move_components(&mv, b(a, "reroute").unwrap_or(true))?;
                 self.commit()?;
                 Ok(vec![text(&r)])
+            }
+            "duplicate_components" => {
+                let names = strs(a, "names");
+                let d = self.doc()?;
+                let idx: Result<Vec<usize>, String> = names.iter().map(|n| d.sch.component_index(n).ok_or_else(|| format!("no component '{n}'"))).collect();
+                let idx = idx?;
+                d.checkpoint();
+                let (c, w, _) = crate::edit::duplicate(d, &idx, &[], &[], i(a, "dx").unwrap_or(0), i(a, "dy").unwrap_or(120))?;
+                let new: Vec<String> = c.iter().map(|&k| d.sch.components[k].name.clone()).collect();
+                let overlaps: Vec<String> = check::check(&d.sch, &d.conn()).issues.iter().filter(|i| i.kind == "component_overlap").map(|i| i.message.clone()).collect();
+                self.commit()?;
+                Ok(vec![text(&json!({"new_components": new, "wires_copied": w.len(), "overlaps": overlaps}))])
+            }
+            "align_components" => {
+                let names = strs(a, "names");
+                let mode = s(a, "mode").ok_or("mode required")?.to_string();
+                let d = self.doc()?;
+                let idx: Result<Vec<usize>, String> = names.iter().map(|n| d.sch.component_index(n).ok_or_else(|| format!("no component '{n}'"))).collect();
+                let moves = crate::edit::align(d, &idx?, &mode)?;
+                d.checkpoint();
+                let r = d.move_components(&moves, true)?;
+                self.commit()?;
+                Ok(vec![text(&json!({"moves": moves.iter().map(|m| json!({"name": m.0, "x": m.1, "y": m.2})).collect::<Vec<_>>(), "rerouted": r}))])
+            }
+            "add_painting" => {
+                let line = crate::edit::make_painting(
+                    s(a, "kind").ok_or("kind required")?,
+                    i(a, "x").unwrap_or(0),
+                    i(a, "y").unwrap_or(0),
+                    i(a, "w").unwrap_or(0),
+                    i(a, "h").unwrap_or(0),
+                    s(a, "color").unwrap_or(""),
+                    i(a, "width").unwrap_or(if s(a, "kind") == Some("text") { 1 } else { 2 }),
+                    s(a, "text").unwrap_or(""),
+                    i(a, "size").unwrap_or(12),
+                    b(a, "filled").unwrap_or(false),
+                )?;
+                let d = self.doc()?;
+                d.checkpoint();
+                d.sch.paintings.push(format!("  {line}"));
+                let k = d.sch.paintings.len() - 1;
+                self.commit()?;
+                Ok(vec![text(&json!({"index": k, "painting": line}))])
+            }
+            "delete_paintings" => {
+                let d = self.doc()?;
+                d.checkpoint();
+                let n0 = d.sch.paintings.len();
+                if b(a, "all").unwrap_or(false) {
+                    d.sch.paintings.clear();
+                } else {
+                    let del: std::collections::HashSet<usize> = a.get("indices").and_then(|v| v.as_array()).map(|v| v.iter().filter_map(|x| x.as_u64().map(|u| u as usize)).collect()).unwrap_or_default();
+                    let mut k = 0;
+                    d.sch.paintings.retain(|_| {
+                        let keep = !del.contains(&k);
+                        k += 1;
+                        keep
+                    });
+                }
+                let removed = n0 - d.sch.paintings.len();
+                self.commit()?;
+                Ok(vec![text(&json!({"deleted": removed}))])
+            }
+            "export_image" => {
+                let mut path = PathBuf::from(s(a, "path").ok_or("path required")?);
+                if path.is_relative() {
+                    path = workdir().join(path);
+                }
+                let d = self.doc()?;
+                let conn = d.conn();
+                let sc = build_scene(&d.sch, &conn, &Overlay::default());
+                let view = fit_view(sc.bounds, 30.0, Some(a.get("scale").and_then(|v| v.as_f64()).unwrap_or(2.0)), 8000.0);
+                let (svg, _) = scene_svg(&sc, &view, &Decor::default());
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir).ok();
+                }
+                if path.extension().map(|e| e.eq_ignore_ascii_case("svg")).unwrap_or(false) {
+                    std::fs::write(&path, svg).map_err(|e| e.to_string())?;
+                } else {
+                    std::fs::write(&path, svg_to_png(&svg)?).map_err(|e| e.to_string())?;
+                }
+                Ok(vec![text(&json!({"saved": path.display().to_string(), "size_px": [view.width_px(), view.height_px()]}))])
             }
             "delete_components" => {
                 let names = strs(a, "names");
@@ -454,6 +593,22 @@ impl Server {
                 self.commit()?;
                 Ok(vec![text(&json!({"name": n, "component": c}))])
             }
+            "add_parameter_sweep" => {
+                let d = self.doc()?;
+                d.checkpoint();
+                let n = d.add_parameter_sweep(
+                    s(a, "sim").ok_or("sim required")?,
+                    s(a, "param").ok_or("param required")?,
+                    s(a, "start").ok_or("start required")?,
+                    s(a, "stop").ok_or("stop required")?,
+                    s(a, "points").unwrap_or("5"),
+                    s(a, "type").unwrap_or("lin"),
+                    s(a, "default"),
+                )?;
+                let c = d.sch.component(&n).unwrap().serialize();
+                self.commit()?;
+                Ok(vec![text(&json!({"name": n, "component": c}))])
+            }
             "get_netlist" => {
                 self.commit()?;
                 let p = self.doc()?.path.clone().ok_or("save the schematic first")?;
@@ -535,15 +690,56 @@ impl Server {
             "plot_results" => {
                 let r = self.sim.as_ref().ok_or("no results yet (run_simulation)")?;
                 let plots = r.find_all(s(a, "analysis"))?;
-                let svg = crate::plot::plot_analysis(&plots, &strs(a, "vectors"), b(a, "db"))?;
-                let png = svg_to_png(&svg)?;
+                let mut spec = crate::diagram::DiagramSpec::default();
+                if let Some(k) = s(a, "kind") {
+                    spec.kind = crate::diagram::DiagramSpec::parse_kind(k).ok_or_else(|| format!("unknown kind '{k}' (rect, polar, smith, table)"))?;
+                }
+                spec.vectors = strs(a, "vectors");
+                spec.db = b(a, "db");
+                spec.phase = b(a, "phase");
+                spec.x_log = b(a, "x_log");
+                spec.y_log = b(a, "y_log").unwrap_or(false);
+                spec.markers = a.get("markers").and_then(|v| v.as_array()).map(|v| v.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default();
+                let range = |k: &str| a.get(k).and_then(|v| v.as_array()).and_then(|v| Some((v.first()?.as_f64()?, v.get(1)?.as_f64()?)));
+                spec.x_range = range("x_range");
+                spec.y_range = range("y_range");
+                if let Some(z) = a.get("z0").and_then(|v| v.as_f64()) {
+                    spec.z0 = z;
+                }
+                spec.title = s(a, "title").map(|t| t.to_string());
+                let (w, h) = if spec.kind == crate::diagram::DiagramKind::Rect { (900.0, 560.0) } else { (720.0, 720.0) };
+                let out = crate::diagram::diagram_svg(&plots, &spec, w, h)?;
+                let png = svg_to_png(&out.svg)?;
                 let path = self.snap_path("plot")?;
                 std::fs::write(&path, &png).map_err(|e| e.to_string())?;
                 Ok(vec![
                     json!({"type": "image", "data": base64::engine::general_purpose::STANDARD.encode(&png), "mimeType": "image/png"}),
-                    text(&json!({"saved": path.display().to_string()})),
+                    text(&json!({"saved": path.display().to_string(), "markers": out.markers})),
                 ])
             }
+            "design_filter" => {
+                let spec = crate::synth::filter_spec(a)?;
+                let mut d = crate::rftools::lc_filter(&spec)?;
+                // analytic check of the synthesized values (ideal terminations)
+                let zl = d.values.get("z_load").and_then(|v| v.as_f64()).unwrap_or(spec.z0);
+                let mut chk = serde_json::Map::new();
+                for (k, f) in [("f1", Some(spec.f1)), ("f2", spec.f2)] {
+                    if let Some(f) = f {
+                        if let Ok((s11, s21)) = crate::rftools::two_port_s_db(&d, f, spec.z0, zl) {
+                            chk.insert(format!("s21_db_at_{k}"), json!((s21 * 100.0).round() / 100.0));
+                            chk.insert(format!("s11_db_at_{k}"), json!((s11 * 100.0).round() / 100.0));
+                        }
+                    }
+                }
+                d.values["check"] = Value::Object(chk);
+                self.place_design_tool(a, d, Some(crate::synth::bench_range(&spec)))
+            }
+            "design_attenuator" => {
+                let (t, db, zi, zo) = crate::synth::attenuator_args(a)?;
+                let d = crate::rftools::attenuator(t, db, zi, zo)?;
+                self.place_design_tool(a, d, Some((1e3, 1e9)))
+            }
+            "calc_transmission_line" => Ok(vec![text(&crate::synth::tline(a)?)]),
             "open_gui" => {
                 self.commit()?;
                 let p = self.doc()?.path.clone().ok_or("save the schematic first")?;
@@ -565,6 +761,31 @@ impl Server {
             }
             other => Err(format!("unknown tool '{other}'")),
         }
+    }
+
+    fn place_design_tool(&mut self, a: &Value, d: crate::rftools::Design, range: Option<(f64, f64)>) -> Result<Vec<Value>, String> {
+        let summary = json!({"title": d.title, "values": d.values, "notes": d.notes,
+            "parts": d.parts.iter().map(|p| json!({"type": p.typ, "name": p.name, "props": p.props, "nets": p.nets})).collect::<Vec<_>>()});
+        if !b(a, "place").unwrap_or(true) {
+            return Ok(vec![text(&summary)]);
+        }
+        let doc = self.doc()?;
+        doc.checkpoint();
+        let (x, y) = match (i(a, "x"), i(a, "y")) {
+            (Some(x), Some(y)) => (x, y),
+            _ => {
+                let conn = doc.conn();
+                let maxy = conn.placed.iter().map(|p| p.bbox[3]).fold(0.0f64, f64::max);
+                (300, (maxy as i32 + 120).max(120))
+            }
+        };
+        let z_load = d.values.get("z_load").and_then(|v| v.as_f64()).or_else(|| a.get("z_out").and_then(|v| v.as_f64())).unwrap_or(50.0);
+        let z_src = a.get("z0").and_then(|v| v.as_f64()).or_else(|| a.get("z_in").and_then(|v| v.as_f64())).unwrap_or(50.0);
+        let bench = if b(a, "test_bench").unwrap_or(false) { range.map(|(lo, hi)| (z_src, z_load, lo, hi)) } else { None };
+        let placed = crate::synth::place_design(doc, &d, x, y, bench)?;
+        let rep = check::check(&doc.sch, &doc.conn());
+        self.commit()?;
+        Ok(vec![text(&json!({"design": summary, "placed": placed, "metrics": rep.metrics}))])
     }
 
     fn snap_path(&mut self, kind: &str) -> Result<PathBuf, String> {
@@ -652,7 +873,8 @@ impl Server {
             })
             .collect();
         let nets: Vec<Value> = conn.nets.iter().map(|n| json!({"name": n.name, "pins": n.pins.iter().map(|&p| conn.pins[p].label.clone()).collect::<Vec<_>>(), "wires": n.wires.len()})).collect();
-        let mut o = json!({"path": d.path.as_ref().map(|p| p.display().to_string()), "components": comps, "nets": nets});
+        let mut o = json!({"path": d.path.as_ref().map(|p| p.display().to_string()), "components": comps, "nets": nets,
+            "paintings": d.sch.paintings.iter().enumerate().map(|(k, p)| json!({"i": k, "painting": p.trim()})).collect::<Vec<_>>()});
         if wires {
             o["wires"] = json!(d.sch.wires.iter().enumerate().map(|(k, w)| json!({"i": k, "p": [w.x1, w.y1, w.x2, w.y2], "net": conn.nets[conn.wire_net[k]].name, "label": if w.label.is_empty() { Value::Null } else { json!(w.label) }})).collect::<Vec<_>>());
         }

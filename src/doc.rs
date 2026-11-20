@@ -120,11 +120,28 @@ impl Doc {
                 n.to_string()
             }
             _ => {
-                let prefix = if typ == "GND" { "GND".into() } else { library::name_prefix(typ) };
+                let prefix = if typ == "GND" {
+                    "GND".into()
+                } else if typ == "Lib" {
+                    let lc = props.get("Lib").and_then(|l| props.get("Comp").map(|c| (l, c)));
+                    lc.and_then(|(l, c)| crate::qlib::find(l.as_str().unwrap_or(""), c.as_str().unwrap_or("")))
+                        .map(|(_, c)| if c.symbol.id_prefix.is_empty() { "X".to_string() } else { c.symbol.id_prefix.clone() })
+                        .unwrap_or_else(|| "X".into())
+                } else {
+                    library::name_prefix(typ)
+                };
                 self.unique(&prefix)
             }
         };
-        let mut c = library::new_component(typ, &name, snap(x), snap(y))?;
+        let mut c = if typ == "Lib" {
+            let get = |k: &str| props.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+            let (Some(l), Some(cn)) = (get("Lib"), get("Comp")) else {
+                return Err("a Lib component needs \"lib\" and \"comp\" (see search_library)".into());
+            };
+            crate::qlib::new_lib_component(&l, &cn, &name, snap(x), snap(y))?
+        } else {
+            library::new_component(typ, &name, snap(x), snap(y))?
+        };
         if typ == "GND" {
             c.active |= 4;
         }
@@ -397,14 +414,42 @@ impl Doc {
                 g
             };
             let grid = build(Costs::default());
-            let mut path = grid.route((t.x, t.y), t.dir, &targets, OWN);
-            if path.is_none() && t.dir.is_some() {
-                path = grid.route((t.x, t.y), None, &targets, OWN);
+            // start from the terminal, or from anywhere on the wiring it already has
+            let mut starts: Vec<((i32, i32), Option<(i32, i32)>)> = vec![((t.x, t.y), t.dir)];
+            if let Some(i) = ti {
+                let isl = &conn.islands[i];
+                for &wi in &isl.wires {
+                    let w = &self.sch.wires[wi];
+                    let (dx, dy) = ((w.x2 - w.x1).signum() * G, (w.y2 - w.y1).signum() * G);
+                    let (mut x, mut y) = (w.x1, w.y1);
+                    loop {
+                        if !starts.iter().any(|s| s.0 == (x, y)) {
+                            starts.push(((x, y), None));
+                        }
+                        if (x, y) == (w.x2, w.y2) || (dx == 0 && dy == 0) || (w.x1 != w.x2 && w.y1 != w.y2) {
+                            break;
+                        }
+                        x += dx;
+                        y += dy;
+                    }
+                }
+                for &pi in &isl.pins {
+                    let p = &conn.pins[pi];
+                    if !starts.iter().any(|s| s.0 == (p.x, p.y)) {
+                        starts.push(((p.x, p.y), Some(p.dir)));
+                    }
+                }
+            }
+            let mut path = grid.route_multi(&starts, &targets, OWN);
+            if path.is_none() {
+                let loose: Vec<((i32, i32), Option<(i32, i32)>)> = starts.iter().map(|s| (s.0, None)).collect();
+                path = grid.route_multi(&loose, &targets, OWN);
             }
             if path.is_none() {
                 // relaxed: allow running next to symbols and through labels
                 let relaxed = build(Costs { near_body: 1, label: 1, near_wire: 1, ..Costs::default() });
-                path = relaxed.route((t.x, t.y), None, &targets, OWN);
+                let loose: Vec<((i32, i32), Option<(i32, i32)>)> = starts.iter().map(|s| (s.0, None)).collect();
+                path = relaxed.route_multi(&loose, &targets, OWN);
             }
             match path {
                 Some(pts) => {
@@ -914,6 +959,57 @@ impl Doc {
     }
 }
 
+impl Doc {
+    /// Parameter sweep (.SW) over `param` for the analysis `sim` (e.g. "TR1", "AC1", "DC1").
+    /// `param` may be a component name (its main value is swept, e.g. "R1", "V1") or a
+    /// variable; a missing variable is created in a .PARAM block with `default`.
+    pub fn add_parameter_sweep(&mut self, sim: &str, param: &str, start: &str, stop: &str, points: &str, typ: &str, default: Option<&str>) -> Result<String, String> {
+        if !self.sch.components.iter().any(|c| c.name == sim && c.typ.starts_with('.')) {
+            let sims: Vec<String> = self.sch.components.iter().filter(|c| c.typ.starts_with('.') && c.typ != ".SW").map(|c| c.name.clone()).collect();
+            return Err(format!("no simulation '{sim}'. Available: {}", sims.join(", ")));
+        }
+        let is_comp = self.sch.component(param).is_some() || param.eq_ignore_ascii_case("temp");
+        if !is_comp {
+            let defined = self.sch.components.iter().any(|c| (c.typ == "SpicePar" || c.typ == "Eqn") && c.props.iter().any(|p| p.value.split('=').next().map(|n| n.trim() == param).unwrap_or(false)));
+            if !defined {
+                let mut m = serde_json::Map::new();
+                m.insert(param.to_string(), json!(default.unwrap_or(start)));
+                match self.sch.components.iter().position(|c| c.typ == "SpicePar") {
+                    Some(i) => apply_props(&mut self.sch.components[i], &m)?,
+                    None => {
+                        let (x, y) = self.free_spot();
+                        let n = self.add_component("SpicePar", None, x, y, None, None, &serde_json::Map::new())?;
+                        let i = self.sch.component_index(&n).unwrap();
+                        self.sch.components[i].props.clear();
+                        apply_props(&mut self.sch.components[i], &m)?;
+                    }
+                }
+            }
+        }
+        let mut p = serde_json::Map::new();
+        for (k, v) in [("Sim", sim), ("Type", typ), ("Param", param), ("Start", start), ("Stop", stop), ("Points", points)] {
+            p.insert(k.into(), json!(v));
+        }
+        self.add_simulation("sweep", &p, None, None)
+    }
+
+    /// A free spot below the circuit for text blocks.
+    fn free_spot(&self) -> (i32, i32) {
+        let conn = self.conn();
+        let mut maxy = 0.0f64;
+        let mut maxx = 0.0f64;
+        for p in &conn.placed {
+            maxy = maxy.max(p.bbox[3]);
+            maxx = maxx.max(p.bbox[2]);
+        }
+        let sims = self.sch.components.iter().filter(|c| c.typ.starts_with('.')).map(|c| c.x).max();
+        match sims {
+            Some(x) => (snap(x + 200), snap(self.sch.components.iter().filter(|c| c.typ.starts_with('.')).map(|c| c.y).max().unwrap_or(0))),
+            None => (snap(maxx as i32 + 80), snap(maxy as i32 + 60)),
+        }
+    }
+}
+
 fn arrive_for(dir: Option<(i32, i32)>) -> Arrive {
     match dir {
         Some((dx, dy)) => [(1, 0), (0, 1), (-1, 0), (0, -1)]
@@ -950,6 +1046,25 @@ fn overlap(a: &[f64; 4], b: &[f64; 4]) -> f64 {
 pub fn apply_props(c: &mut Component, props: &serde_json::Map<String, Value>) -> Result<(), String> {
     let info = lib().info(&c.typ);
     for (k, v) in props {
+        if c.typ == "Lib" || c.typ == "Sub" {
+            if c.typ == "Lib" && (k == "Lib" || k == "Comp") {
+                continue; // fixed when the component is created
+            }
+            let val = match v {
+                Value::String(s) => s.clone(),
+                Value::Object(o) => o.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                other => other.to_string(),
+            };
+            let n = c.props.len();
+            match (0..n).find(|&i| crate::qlib::param_name(c, i, None).map(|p| p.eq_ignore_ascii_case(k)).unwrap_or(false)) {
+                Some(i) => c.props[i].value = val,
+                None => {
+                    let names: Vec<String> = (0..n).filter_map(|i| crate::qlib::param_name(c, i, None)).collect();
+                    return Err(format!("{} has no parameter '{k}'. Parameters: {}", c.name, names.join(", ")));
+                }
+            }
+            continue;
+        }
         let (val, show) = match v {
             Value::String(s) => (s.clone(), None),
             Value::Number(n) => (n.to_string(), None),
