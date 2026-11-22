@@ -46,6 +46,12 @@ class Client:
 
 def main():
     c = Client()
+    # stateless 2026-07-28 era: discovery without any handshake
+    meta = {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {}}}
+    disc = c.rpc("server/discover", meta)
+    assert disc["resultType"] == "complete" and disc["supportedVersions"][0] == "2026-07-28", disc
+    assert c.rpc("tools/list", meta)["resultType"] == "complete"
+    # session-based era on the same process
     init = c.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e", "version": "0"}})
     assert init["serverInfo"]["name"] == "qucs-s-rs"
     tools = c.rpc("tools/list")["tools"]

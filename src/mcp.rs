@@ -1001,39 +1001,185 @@ pub fn serve() {
     }
 }
 
+/// Stateless protocol revision: every request carries its version in `params._meta`.
+const MODERN_VERSION: &str = "2026-07-28";
+/// Session-based revisions served through the `initialize` handshake (newest first).
+const LEGACY_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+const META_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
+/// Lifetime of cacheable list results; the tool set never changes while the server runs.
+const LIST_TTL_MS: u64 = 3_600_000;
+
+fn supported_versions() -> Vec<&'static str> {
+    std::iter::once(MODERN_VERSION).chain(LEGACY_VERSIONS.iter().copied()).collect()
+}
+
+fn server_info() -> Value {
+    json!({"name": "qucs-s-rs", "version": env!("CARGO_PKG_VERSION")})
+}
+
+fn capabilities() -> Value {
+    json!({"tools": {"listChanged": false}})
+}
+
+type RpcResult = Result<Value, (i64, String, Option<Value>)>;
+
+/// Serves both protocol eras. A request whose `params._meta` names a protocol version is handled
+/// statelessly under 2026-07-28 rules; anything else (the `initialize` handshake and requests
+/// from clients that negotiated a session-based revision) keeps the legacy semantics.
 pub fn handle(server: &mut Server, m: &Value) -> Option<Value> {
     let id = m.get("id").cloned();
     let method = m.get("method").and_then(|v| v.as_str()).unwrap_or("");
     let params = m.get("params").cloned().unwrap_or(json!({}));
     let id = id?; // notifications get no response
-    let result: Result<Value, (i64, String)> = match method {
+    let requested = params.get("_meta").and_then(|v| v.get(META_VERSION));
+    let result = match requested {
+        Some(v) => handle_modern(server, method, &params, v),
+        None if method == "server/discover" => Err((-32602, format!("missing params._meta[\"{META_VERSION}\"]"), None)),
+        None => handle_legacy(server, method, &params),
+    };
+    Some(match result {
+        Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
+        Err((c, msg, data)) => {
+            let mut e = json!({"code": c, "message": msg});
+            if let Some(d) = data {
+                e["data"] = d;
+            }
+            json!({"jsonrpc": "2.0", "id": id, "error": e})
+        }
+    })
+}
+
+fn handle_modern(server: &mut Server, method: &str, params: &Value, requested: &Value) -> RpcResult {
+    let Some(ver) = requested.as_str() else {
+        return Err((-32602, format!("params._meta[\"{META_VERSION}\"] must be a string"), None));
+    };
+    if ver != MODERN_VERSION {
+        return Err((-32022, "Unsupported protocol version".into(), Some(json!({"supported": supported_versions(), "requested": ver}))));
+    }
+    let cacheable = |mut r: Value| {
+        r["ttlMs"] = json!(LIST_TTL_MS);
+        r["cacheScope"] = json!("public");
+        r
+    };
+    let mut r = match method {
+        "server/discover" => cacheable(json!({"supportedVersions": supported_versions(), "capabilities": capabilities(), "instructions": INSTRUCTIONS})),
+        "tools/list" => cacheable(json!({"tools": tools()})),
+        "resources/list" => cacheable(json!({"resources": []})),
+        "prompts/list" => cacheable(json!({"prompts": []})),
+        "tools/call" => call_tool(server, params)?,
+        // `initialize` and `ping` belong to the session-based era only
+        _ => return Err((-32601, format!("method not found: {method}"), None)),
+    };
+    r["resultType"] = json!("complete");
+    r["_meta"] = json!({META_SERVER_INFO: server_info()});
+    Ok(r)
+}
+
+fn handle_legacy(server: &mut Server, method: &str, params: &Value) -> RpcResult {
+    match method {
         "initialize" => {
-            let ver = params.get("protocolVersion").and_then(|v| v.as_str()).unwrap_or("2025-06-18").to_string();
+            // answer with the client's version when we implement it, otherwise our newest session-based one
+            let asked = params.get("protocolVersion").and_then(|v| v.as_str()).unwrap_or("");
+            let ver = LEGACY_VERSIONS.iter().copied().find(|v| *v == asked).unwrap_or(LEGACY_VERSIONS[0]);
             Ok(json!({
                 "protocolVersion": ver,
-                "capabilities": {"tools": {"listChanged": false}},
-                "serverInfo": {"name": "qucs-s-rs", "version": env!("CARGO_PKG_VERSION")},
+                "capabilities": capabilities(),
+                "serverInfo": server_info(),
                 "instructions": INSTRUCTIONS,
             }))
         }
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools()})),
-        "tools/call" => {
-            let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| server.call(&name, &args)));
-            match r {
-                Ok(Ok(content)) => Ok(json!({"content": content, "isError": false})),
-                Ok(Err(e)) => Ok(json!({"content": [{"type": "text", "text": format!("Error: {e}")}], "isError": true})),
-                Err(_) => Ok(json!({"content": [{"type": "text", "text": "Error: internal panic while running the tool"}], "isError": true})),
-            }
-        }
+        "tools/call" => call_tool(server, params),
         "resources/list" => Ok(json!({"resources": []})),
         "prompts/list" => Ok(json!({"prompts": []})),
-        _ => Err((-32601, format!("method not found: {method}"))),
-    };
-    Some(match result {
-        Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
-        Err((c, msg)) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": c, "message": msg}}),
+        _ => Err((-32601, format!("method not found: {method}"), None)),
+    }
+}
+
+fn call_tool(server: &mut Server, params: &Value) -> RpcResult {
+    let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if !tools().iter().any(|t| t["name"] == name.as_str()) {
+        return Err((-32602, format!("unknown tool: {name}"), None));
+    }
+    let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| server.call(&name, &args)));
+    Ok(match r {
+        Ok(Ok(content)) => json!({"content": content, "isError": false}),
+        Ok(Err(e)) => json!({"content": [{"type": "text", "text": format!("Error: {e}")}], "isError": true}),
+        Err(_) => json!({"content": [{"type": "text", "text": "Error: internal panic while running the tool"}], "isError": true}),
     })
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    fn modern(method: &str, extra: Value) -> Value {
+        let mut params = json!({"_meta": {META_VERSION: MODERN_VERSION, "io.modelcontextprotocol/clientCapabilities": {}}});
+        if let (Some(p), Value::Object(e)) = (params.as_object_mut(), extra) {
+            p.extend(e);
+        }
+        json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+    }
+
+    #[test]
+    fn discover_lists_both_eras() {
+        let r = handle(&mut Server::new(), &modern("server/discover", json!({}))).unwrap();
+        let res = &r["result"];
+        assert_eq!(res["resultType"], "complete");
+        assert_eq!(res["supportedVersions"][0], MODERN_VERSION);
+        assert!(res["supportedVersions"].as_array().unwrap().iter().any(|v| v == "2025-06-18"));
+        assert_eq!(res["capabilities"]["tools"]["listChanged"], false);
+        assert_eq!(res["_meta"][META_SERVER_INFO]["name"], "qucs-s-rs");
+        assert!(res["ttlMs"].is_u64() && res["cacheScope"] == "public");
+    }
+
+    #[test]
+    fn modern_list_and_call() {
+        let mut s = Server::new();
+        let r = handle(&mut s, &modern("tools/list", json!({}))).unwrap();
+        assert_eq!(r["result"]["resultType"], "complete");
+        assert!(r["result"]["ttlMs"].is_u64());
+        assert!(!r["result"]["tools"].as_array().unwrap().is_empty());
+        let r = handle(&mut s, &modern("tools/call", json!({"name": "list_component_types", "arguments": {}}))).unwrap();
+        assert_eq!(r["result"]["resultType"], "complete");
+        assert_eq!(r["result"]["isError"], false);
+        assert!(r["result"].get("ttlMs").is_none());
+        let r = handle(&mut s, &modern("tools/call", json!({"name": "no_such_tool"}))).unwrap();
+        assert_eq!(r["error"]["code"], -32602);
+        // removed from the stateless era
+        for m in ["ping", "initialize"] {
+            assert_eq!(handle(&mut s, &modern(m, json!({}))).unwrap()["error"]["code"], -32601, "{m}");
+        }
+    }
+
+    #[test]
+    fn unsupported_and_missing_versions() {
+        let mut s = Server::new();
+        let mut m = modern("tools/list", json!({}));
+        m["params"]["_meta"][META_VERSION] = json!("1900-01-01");
+        let e = &handle(&mut s, &m).unwrap()["error"];
+        assert_eq!(e["code"], -32022);
+        assert_eq!(e["data"]["requested"], "1900-01-01");
+        assert_eq!(e["data"]["supported"][0], MODERN_VERSION);
+        let bare = json!({"jsonrpc": "2.0", "id": 2, "method": "server/discover", "params": {}});
+        assert_eq!(handle(&mut s, &bare).unwrap()["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn legacy_handshake_negotiates() {
+        let mut s = Server::new();
+        let init = |v: &str| json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": v, "capabilities": {}}});
+        for (asked, got) in [("2025-06-18", "2025-06-18"), ("2025-11-25", "2025-11-25"), ("2099-01-01", "2025-11-25"), (MODERN_VERSION, "2025-11-25")] {
+            let r = handle(&mut s, &init(asked)).unwrap();
+            assert_eq!(r["result"]["protocolVersion"], got, "{asked}");
+            assert!(r["result"].get("resultType").is_none());
+        }
+        let ping = json!({"jsonrpc": "2.0", "id": 3, "method": "ping"});
+        assert_eq!(handle(&mut s, &ping).unwrap()["result"], json!({}));
+        let list = json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list"});
+        assert!(handle(&mut s, &list).unwrap()["result"].get("ttlMs").is_none());
+    }
 }
