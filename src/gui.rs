@@ -46,10 +46,13 @@ pub fn run(path: Option<PathBuf>) {
         }
     }
     detach_own_console();
-    let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 780.0]).with_maximized(true).with_title("Qucs-S RS"),
-        ..Default::default()
-    };
+    let st = crate::settings::Settings::load();
+    let mut vp = egui::ViewportBuilder::default().with_title("Qucs-S RS").with_icon(std::sync::Arc::new(app_icon())).with_maximized(st.maximized);
+    match st.window {
+        Some([x, y, w, h]) if w >= 400.0 && h >= 300.0 => vp = vp.with_inner_size([w, h]).with_position([x.max(0.0), y.max(0.0)]),
+        _ => vp = vp.with_inner_size([1280.0, 780.0]),
+    }
+    let opts = eframe::NativeOptions { viewport: vp, ..Default::default() };
     let _ = eframe::run_native("qucs-s-rs", opts, Box::new(move |cc| Ok(Box::new(App::new(cc, path)))));
 }
 
@@ -148,6 +151,48 @@ struct App {
     active: usize,
     last_heartbeat: Instant,
     mc: McWindow,
+    // ---- preferences, dialogs
+    settings: crate::settings::Settings,
+    confirm: Option<Confirm>,
+    allow_close: bool,
+    find_open: bool,
+    find_query: String,
+    find_focus: bool,
+    about_open: bool,
+    canvas_rect: Rect,
+    op_rx: Option<(u64, Receiver<Result<sim::OperatingPoint, String>>)>,
+    op: Option<OpView>,
+    op_window: bool,
+    subckt_prompt: Option<String>,
+    shot: Option<Shot>,
+}
+
+/// Self-test hook: `QUCS_RS_SHOT=out.png` saves a screenshot of the window and exits.
+/// `QUCS_RS_SHOT_ACTIONS` (comma separated) prepares the view first:
+/// `op` (DC operating point), `find:<text>`, `about`, `quit` (the save-changes dialog),
+/// `select:<name>`, `zoom:<factor>`.
+struct Shot {
+    path: PathBuf,
+    actions: Vec<String>,
+    frame: u32,
+    requested: bool,
+}
+
+/// A pending "save changes?" question.
+#[derive(Clone, Copy, PartialEq)]
+enum Confirm {
+    /// closing the tab with this index
+    Tab(usize),
+    /// closing the window
+    Quit,
+}
+
+/// A computed DC operating point and the schematic it belongs to.
+struct OpView {
+    tab_id: u64,
+    comps: Vec<crate::schematic::Component>,
+    wires: Vec<crate::schematic::Wire>,
+    op: sim::OperatingPoint,
 }
 
 /// Per-document state of an inactive tab.
@@ -330,7 +375,13 @@ fn load_fonts(ctx: &egui::Context) {
         ("meiryo", r"C:\Windows\Fonts\meiryo.ttc", 0),
         ("msgothic", r"C:\Windows\Fonts\msgothic.ttc", 0),
         ("noto_cjk", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
+        ("noto_cjk2", "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", 0),
+        ("noto_cjk3", "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc", 0),
+        ("noto_cjk4", "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc", 0),
+        ("droid", "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf", 0),
         ("hiragino", "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc", 0),
+        ("hiragino2", "/System/Library/Fonts/Hiragino Sans GB.ttc", 0),
+        ("arialuni", "/Library/Fonts/Arial Unicode.ttf", 0),
     ];
     let mut first = true;
     let mut cjk = false;
@@ -360,6 +411,11 @@ fn load_fonts(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
+}
+
+/// Window / taskbar icon (same drawing as the .exe icon, see build.rs).
+fn app_icon() -> egui::IconData {
+    egui::IconData { rgba: crate::icon_pixels::icon_rgba(64), width: 64, height: 64 }
 }
 
 /// `canonicalize` on Windows yields `\?\C:\...`; Qucs-S and users expect plain paths.
@@ -450,6 +506,9 @@ impl App {
         }
         let theme_pref = theme::load_pref();
         theme::install(&cc.egui_ctx, theme_pref);
+        // Ctrl +/- zoom the schematic, not the whole UI
+        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        let settings = crate::settings::Settings::load();
         let mut status = String::new();
         let doc = match &path {
             Some(p) if p.exists() => Doc::open(p).unwrap_or_else(|e| {
@@ -461,6 +520,11 @@ impl App {
         };
         let conn = doc.conn();
         let disk_mtime = doc.path.as_ref().and_then(mtime);
+        let mut settings = settings;
+        if let Some(p) = doc.path.as_ref().filter(|p| p.exists()) {
+            settings.add_recent(p);
+            settings.save();
+        }
         App {
             conn,
             doc,
@@ -485,12 +549,12 @@ impl App {
             query: String::new(),
             lib_query: String::new(),
             palette_tab: 0,
-            color_nets: false,
-            pin_names: false,
-            show_issues: true,
-            show_grid: true,
-            auto_save: true,
-            auto_reroute: true,
+            color_nets: settings.color_nets,
+            pin_names: settings.pin_names,
+            show_issues: settings.show_issues,
+            show_grid: settings.show_grid,
+            auto_save: settings.auto_save,
+            auto_reroute: settings.auto_reroute,
             disk_mtime,
             last_poll: Instant::now(),
             external_change: false,
@@ -526,7 +590,131 @@ impl App {
             active: 0,
             last_heartbeat: Instant::now() - std::time::Duration::from_secs(10),
             mc: McWindow::default(),
+            settings,
+            confirm: None,
+            allow_close: false,
+            find_open: false,
+            find_query: String::new(),
+            find_focus: false,
+            about_open: false,
+            canvas_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0)),
+            op_rx: None,
+            op: None,
+            op_window: false,
+            subckt_prompt: None,
+            shot: std::env::var_os("QUCS_RS_SHOT").map(|p| Shot {
+                path: PathBuf::from(p),
+                actions: std::env::var("QUCS_RS_SHOT_ACTIONS").unwrap_or_default().split(',').map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect(),
+                frame: 0,
+                requested: false,
+            }),
         }
+    }
+
+    fn drive_shot(&mut self, ctx: &egui::Context) {
+        let Some(sh) = self.shot.as_mut() else { return };
+        sh.frame += 1;
+        let frame = sh.frame;
+        ctx.request_repaint();
+        if frame == 5 {
+            let actions = sh.actions.clone();
+            for a in actions {
+                let (k, v) = a.split_once(':').unwrap_or((a.as_str(), ""));
+                match k {
+                    "op" => self.run_op(),
+                    "find" => {
+                        self.find_open = true;
+                        self.find_query = v.to_string();
+                    }
+                    "about" => self.about_open = true,
+                    "quit" => {
+                        self.doc.dirty = true;
+                        self.auto_save = false;
+                        self.confirm = Some(Confirm::Quit);
+                    }
+                    "select" => self.sel = self.doc.sch.component_index(v).into_iter().collect(),
+                    "zoom" => self.zoom_by(v.parse().unwrap_or(1.0)),
+                    _ => {}
+                }
+            }
+        }
+        // screenshot once background work is done
+        let busy = self.op_rx.is_some() || self.sim_rx.is_some();
+        if let Some(sh) = self.shot.as_mut() {
+            if frame > 30 && !busy && !sh.requested {
+                sh.requested = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+            }
+            if frame > 3000 {
+                eprintln!("shot: timed out");
+                std::process::exit(2);
+            }
+        }
+        let img = ctx.input(|i| {
+            i.raw.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        if let (Some(img), Some(sh)) = (img, self.shot.as_ref()) {
+            let [w, h] = img.size;
+            let rgba: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
+            let r = resvg::tiny_skia::IntSize::from_wh(w as u32, h as u32)
+                .and_then(|sz| resvg::tiny_skia::Pixmap::from_vec(rgba, sz))
+                .ok_or_else(|| "bad image".to_string())
+                .and_then(|pm| pm.encode_png().map_err(|e| e.to_string()))
+                .and_then(|png| std::fs::write(&sh.path, png).map_err(|e| e.to_string()));
+            match r {
+                Ok(_) => eprintln!("shot: {} ({}) {}", sh.path.display(), self.status, w),
+                Err(e) => eprintln!("shot failed: {e}"),
+            }
+            self.shot = None;
+            self.allow_close = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// Edits that would be lost: not saved to disk (auto-save only covers named files).
+    fn unsaved(&self, d: &Doc) -> bool {
+        d.dirty && (d.path.is_none() || !self.auto_save)
+    }
+
+    fn tab_unsaved(&self, i: usize) -> bool {
+        if i == self.active {
+            self.unsaved(&self.doc)
+        } else {
+            self.tabs.get(i).and_then(|t| t.as_ref()).map(|t| self.unsaved(&t.doc)).unwrap_or(false)
+        }
+    }
+
+    /// Save the active document (asks for a name when it has none). False when not saved.
+    fn save_current(&mut self) -> bool {
+        if self.doc.path.is_none() {
+            return self.save_as();
+        }
+        match self.doc.save() {
+            Ok(p) => {
+                self.disk_mtime = mtime(&p);
+                self.status = format!("保存: {}", p.display());
+                true
+            }
+            Err(e) => {
+                self.status = format!("保存エラー: {e}");
+                false
+            }
+        }
+    }
+
+    /// Write the view toggles into the settings and store them.
+    fn store_settings(&mut self) {
+        let s = &mut self.settings;
+        s.color_nets = self.color_nets;
+        s.pin_names = self.pin_names;
+        s.show_issues = self.show_issues;
+        s.show_grid = self.show_grid;
+        s.auto_save = self.auto_save;
+        s.auto_reroute = self.auto_reroute;
+        s.save();
     }
 
     // ------------------------------------------------------------------ model sync
@@ -610,7 +798,9 @@ impl App {
         .to_string();
         if st != self.last_state {
             let p = crate::mcp::gui_state_path();
-            let _ = std::fs::create_dir_all(p.parent().unwrap());
+            if let Some(d) = p.parent() {
+                let _ = std::fs::create_dir_all(d);
+            }
             let _ = std::fs::write(&p, &st);
             self.last_state = st;
         }
@@ -695,7 +885,7 @@ impl App {
             .iter()
             .map(|p| (((p.x as f64 - x).powi(2) + (p.y as f64 - y).powi(2)).sqrt(), p))
             .filter(|(d, _)| *d <= tol)
-            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
+            .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, p)| p.label.clone())
     }
 
@@ -919,8 +1109,380 @@ impl App {
                     self.new_tab(d);
                 }
                 self.status = format!("開きました: {}", p.display());
+                self.settings.add_recent(p);
+                self.settings.save();
             }
+            Err(e) => {
+                self.status = e;
+                // drop stale entries from the recent list
+                if !p.exists() {
+                    self.settings.recent.retain(|r| std::path::Path::new(r) != p);
+                    self.settings.save();
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ DC operating point
+
+    fn run_op(&mut self) {
+        let Some(p) = self.doc.path.clone() else {
+            self.status = "先に保存してください".into();
+            return;
+        };
+        if let Err(e) = self.doc.save() {
+            self.status = e;
+            return;
+        }
+        self.disk_mtime = mtime(&p);
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(sim::operating_point(&p, 120));
+        });
+        self.op_rx = Some((self.tab_id, rx));
+        self.status = "DC 動作点を計算中…".into();
+    }
+
+    /// The operating point is shown while the schematic is unchanged since it was computed.
+    fn op_visible(&self) -> bool {
+        self.op.as_ref().map(|o| o.tab_id == self.tab_id && o.comps == self.doc.sch.components && o.wires == self.doc.sch.wires).unwrap_or(false)
+    }
+
+    fn poll_op(&mut self) {
+        let Some((tid, rx)) = &self.op_rx else { return };
+        let Ok(r) = rx.try_recv() else { return };
+        let tid = *tid;
+        self.op_rx = None;
+        match r {
+            Ok(op) if tid == self.tab_id => {
+                let n = op.net_volts.iter().filter(|v| v.is_some()).count();
+                self.status = if op.errors.is_empty() { format!("DC 動作点: {n} ネット") } else { format!("DC 動作点（警告あり）: {}", op.errors.join(" / ")) };
+                self.op = Some(OpView { tab_id: tid, comps: self.doc.sch.components.clone(), wires: self.doc.sch.wires.clone(), op });
+                self.op_window = true;
+            }
+            Ok(_) => {}
+            Err(e) => self.status = format!("DC 動作点の計算に失敗: {e}"),
+        }
+    }
+
+    /// Voltage tags on the canvas, one per net at its longest wire (or first pin).
+    fn paint_op(&self, painter: &egui::Painter, canvas: Rect) {
+        let Some(o) = self.op.as_ref().filter(|_| self.op_visible()) else { return };
+        let pal = self.pal();
+        for (ni, net) in self.conn.nets.iter().enumerate() {
+            if net.name.eq_ignore_ascii_case("gnd") {
+                continue;
+            }
+            let Some(v) = o.op.net_volts.get(ni).copied().flatten() else { continue };
+            let at = net
+                .wires
+                .iter()
+                .filter_map(|&wi| self.doc.sch.wires.get(wi))
+                .max_by_key(|w| w.len())
+                .map(|w| ((w.x1 + w.x2) as f64 / 2.0, (w.y1 + w.y2) as f64 / 2.0))
+                .or_else(|| net.pins.first().map(|&p| (self.conn.pins[p].x as f64, self.conn.pins[p].y as f64)));
+            let Some((x, y)) = at else { continue };
+            let pos = self.to_screen(canvas, x, y) + Vec2::new(4.0, 3.0);
+            let galley = painter.layout_no_wrap(format!("{}V", crate::plot::eng(v)), FontId::proportional(12.0), pal.on_accent);
+            let r = Rect::from_min_size(pos, galley.size() + Vec2::new(8.0, 2.0));
+            painter.rect_filled(r, 4.0, pal.accent.gamma_multiply(0.92));
+            painter.galley(pos + Vec2::new(4.0, 1.0), galley, pal.on_accent);
+        }
+    }
+
+    fn op_window(&mut self, ctx: &egui::Context) {
+        if !self.op_window || !self.op_visible() {
+            return;
+        }
+        let Some(o) = &self.op else { return };
+        let mut open = true;
+        egui::Window::new("DC 動作点").open(&mut open).default_size([360.0, 420.0]).min_width(320.0).show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::Grid::new("opv").striped(true).num_columns(2).show(ui, |ui| {
+                    ui.strong("ネット");
+                    ui.strong("電圧");
+                    ui.end_row();
+                    let mut rows: Vec<(&String, f64)> = o.op.net_names.iter().zip(&o.op.net_volts).filter(|(n, _)| !n.eq_ignore_ascii_case("gnd")).filter_map(|(n, v)| v.map(|v| (n, v))).collect();
+                    rows.sort_by(|a, b| a.0.starts_with("_net").cmp(&b.0.starts_with("_net")).then(a.0.cmp(b.0)));
+                    for (n, v) in rows {
+                        ui.label(n);
+                        ui.monospace(format!("{}V", crate::plot::eng(v)));
+                        ui.end_row();
+                    }
+                    if !o.op.currents.is_empty() {
+                        ui.end_row();
+                        ui.strong("素子");
+                        ui.strong("電流");
+                        ui.end_row();
+                        for (n, v) in &o.op.currents {
+                            ui.label(n);
+                            ui.monospace(format!("{}A", crate::plot::eng(*v)));
+                            ui.end_row();
+                        }
+                    }
+                });
+                for e in &o.op.errors {
+                    ui.colored_label(ui.visuals().warn_fg_color, e);
+                }
+            });
+        });
+        if !open {
+            self.op_window = false;
+        }
+    }
+
+    // ------------------------------------------------------------------ PDF / print
+
+    fn export_pdf(&mut self) {
+        let name = self.doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| format!("{}.pdf", s.to_string_lossy())).unwrap_or_else(|| "schematic.pdf".into());
+        let Some(p) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(name).save_file() else { return };
+        let title = self.doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        self.status = match crate::pdf::schematic_pdf(&self.doc.sch, &self.conn, &title).and_then(|b| std::fs::write(&p, b).map_err(|e| e.to_string())) {
+            Ok(_) => format!("PDF 書き出し: {}", p.display()),
+            Err(e) => format!("PDF 書き出し失敗: {e}"),
+        };
+    }
+
+    /// Print = PDF in the temp folder, opened in the system viewer.
+    fn print(&mut self) {
+        let title = self.doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "untitled".into());
+        let p = std::env::temp_dir().join("qucs-s-rs").join(format!("{title}_print.pdf"));
+        let r = crate::pdf::schematic_pdf(&self.doc.sch, &self.conn, &title).and_then(|b| {
+            if let Some(d) = p.parent() {
+                let _ = std::fs::create_dir_all(d);
+            }
+            std::fs::write(&p, b).map_err(|e| e.to_string())
+        });
+        self.status = match r.and_then(|_| crate::pdf::open_with_system(&p)) {
+            Ok(_) => "印刷用 PDF をビューアで開きました。ビューアから印刷してください".into(),
+            Err(e) => format!("印刷の準備に失敗: {e}"),
+        };
+    }
+
+    // ------------------------------------------------------------------ hierarchy
+
+    fn open_selected_sub(&mut self) {
+        let Some(name) = self.sel.first().and_then(|&i| self.doc.sch.components.get(i)).map(|c| c.name.clone()) else { return };
+        match crate::hier::sub_file(&self.doc, &name) {
+            Ok(p) => self.open_path(&p),
             Err(e) => self.status = e,
+        }
+    }
+
+    fn create_subcircuit(&mut self, file: &str) {
+        let names: Vec<String> = self.sel.iter().filter_map(|&i| self.doc.sch.components.get(i)).map(|c| c.name.clone()).collect();
+        if self.doc.dirty {
+            if let Err(e) = self.doc.save() {
+                self.status = e;
+                return;
+            }
+        }
+        self.doc.checkpoint();
+        match crate::hier::create_subcircuit(&mut self.doc, &names, file, false) {
+            Ok(r) => {
+                self.status = format!("サブ回路 {} を作成（ポート {} 個）", r["subcircuit_file"].as_str().unwrap_or(file), r["ports"].as_array().map(|a| a.len()).unwrap_or(0));
+                self.sel.clear();
+                self.sel_wires.clear();
+                self.changed();
+                if let Some(i) = r["component"].as_str().and_then(|n| self.doc.sch.component_index(n)) {
+                    self.sel = vec![i];
+                }
+            }
+            Err(e) => {
+                self.doc.undo();
+                self.changed();
+                self.status = format!("サブ回路を作成できません: {e}");
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ find
+
+    fn find_window(&mut self, ctx: &egui::Context) {
+        if !self.find_open {
+            return;
+        }
+        let mut open = true;
+        let mut goto: Option<(Vec<usize>, Vec<usize>, (f64, f64))> = None;
+        egui::Window::new("検索").open(&mut open).default_size([320.0, 360.0]).show(ctx, |ui| {
+            let r = ui.add(egui::TextEdit::singleline(&mut self.find_query).hint_text("部品名・種類・値・ネット名").desired_width(f32::INFINITY));
+            if self.find_focus {
+                r.request_focus();
+                self.find_focus = false;
+            }
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let q = self.find_query.trim().to_lowercase();
+            if q.is_empty() {
+                ui.small("入力すると一致する部品とネットを表示します。クリックで選択して移動。");
+                return;
+            }
+            let mut hits: Vec<(String, Vec<usize>, Vec<usize>, (f64, f64))> = Vec::new();
+            for (i, c) in self.doc.sch.components.iter().enumerate() {
+                let props: Vec<&str> = c.props.iter().map(|p| p.value.as_str()).collect();
+                let hay = format!("{} {} {}", c.name, c.typ, props.join(" ")).to_lowercase();
+                if hay.contains(&q) {
+                    let b = self.conn.placed.get(i).map(|p| p.bbox).unwrap_or([c.x as f64; 4]);
+                    let val = c.props.first().map(|p| p.value.clone()).unwrap_or_default();
+                    hits.push((format!("{}  ({} {})", c.name, c.typ, val), vec![i], vec![], ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)));
+                }
+            }
+            for net in &self.conn.nets {
+                if net.name.to_lowercase().contains(&q) {
+                    let at = net.wires.first().and_then(|&w| self.doc.sch.wires.get(w)).map(|w| (w.x1 as f64, w.y1 as f64)).or_else(|| net.pins.first().map(|&p| (self.conn.pins[p].x as f64, self.conn.pins[p].y as f64)));
+                    if let Some(at) = at {
+                        hits.push((format!("ネット {}  ({} ピン)", net.name, net.pins.len()), vec![], net.wires.clone(), at));
+                    }
+                }
+            }
+            ui.small(format!("{} 件", hits.len()));
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for (k, (label, comps, wires, at)) in hits.iter().enumerate() {
+                    if ui.selectable_label(false, label).clicked() || (enter && k == 0) {
+                        goto = Some((comps.clone(), wires.clone(), *at));
+                    }
+                }
+            });
+        });
+        self.find_open = open;
+        if let Some((comps, wires, (x, y))) = goto {
+            self.tool = Tool::Select;
+            self.sel = comps;
+            self.sel_wires = wires;
+            self.sel_paint.clear();
+            let c = self.canvas_rect;
+            self.offset = Vec2::new(x as f32, y as f32) - c.size() / 2.0 / self.zoom;
+        }
+    }
+
+    fn zoom_by(&mut self, factor: f32) {
+        let c = self.canvas_rect;
+        let center = c.center();
+        let before = self.to_sch_f(c, center);
+        self.zoom = (self.zoom * factor).clamp(0.1, 12.0);
+        let after = self.to_sch_f(c, center);
+        self.offset += Vec2::new((before.0 - after.0) as f32, (before.1 - after.1) as f32);
+    }
+
+    // ------------------------------------------------------------------ dialogs
+
+    fn about_window(&mut self, ctx: &egui::Context) {
+        if !self.about_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Qucs-S RS について").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            ui.heading(format!("Qucs-S RS {}", env!("CARGO_PKG_VERSION")));
+            ui.label("Qucs-S の Rust 製フォーク（軽量回路図エディタ＋MCP サーバー）");
+            ui.label("ライセンス: GPL-2.0-or-later");
+            ui.separator();
+            let found = |r: Result<PathBuf, String>| r.map(|p| p.display().to_string()).unwrap_or_else(|_| "見つかりません".into());
+            egui::Grid::new("about").num_columns(2).show(ui, |ui| {
+                ui.label("ngspice");
+                ui.monospace(found(sim::ngspice_path()));
+                ui.end_row();
+                ui.label("Qucs-S");
+                ui.monospace(found(sim::qucs_s_path()));
+                ui.end_row();
+                ui.label("ネットリスト");
+                ui.label(if sim::qucs_s_path().is_ok() { "内蔵（未対応の部品は Qucs-S）" } else { "内蔵のみ" });
+                ui.end_row();
+                ui.label("設定");
+                ui.monospace(crate::settings::config_dir().map(|p| p.display().to_string()).unwrap_or_default());
+                ui.end_row();
+            });
+        });
+        self.about_open = open;
+    }
+
+    fn subckt_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut name) = self.subckt_prompt.take() else { return };
+        let (mut ok, mut cancel) = (false, false);
+        egui::Window::new("サブ回路を作成").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+            ui.label(format!("選択した {} 個の部品を新しいファイルへ移し、Sub 部品で置き換えます。", self.sel.len()));
+            ui.label("外へつながるネットごとにポートができます。");
+            ui.horizontal(|ui| {
+                ui.label("ファイル名");
+                let r = ui.text_edit_singleline(&mut name);
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    ok = true;
+                }
+            });
+            ui.small("（現在の回路図と同じフォルダに保存）");
+            ui.horizontal(|ui| {
+                ok |= ui.button("作成").clicked();
+                cancel = ui.button("キャンセル").clicked();
+            });
+        });
+        if ok && !name.trim().is_empty() {
+            self.create_subcircuit(name.trim());
+        } else if !cancel {
+            self.subckt_prompt = Some(name);
+        }
+    }
+
+    /// "Save changes?" for closing a tab or the window.
+    fn confirm_dialog(&mut self, ctx: &egui::Context) {
+        let Some(c) = self.confirm else { return };
+        enum Answer {
+            Save,
+            Discard,
+            Cancel,
+        }
+        let mut answer = None;
+        let unsaved: Vec<usize> = (0..self.tabs.len()).filter(|&i| self.tab_unsaved(i)).collect();
+        egui::Window::new("変更の保存").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+            match c {
+                Confirm::Tab(i) => {
+                    ui.label(format!("「{}」への変更を保存しますか？", self.tab_title(i).trim_end_matches(" *")));
+                }
+                Confirm::Quit => {
+                    ui.label("保存していない変更があります:");
+                    for &i in &unsaved {
+                        ui.label(format!("  • {}", self.tab_title(i).trim_end_matches(" *")));
+                    }
+                }
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let save = if c == Confirm::Quit { "すべて保存して終了" } else { "保存" };
+                let discard = if c == Confirm::Quit { "保存せずに終了" } else { "保存しない" };
+                if ui.button(save).clicked() {
+                    answer = Some(Answer::Save);
+                }
+                if ui.button(discard).clicked() {
+                    answer = Some(Answer::Discard);
+                }
+                if ui.button("キャンセル").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    answer = Some(Answer::Cancel);
+                }
+            });
+        });
+        let Some(a) = answer else { return };
+        self.confirm = None;
+        match (c, a) {
+            (_, Answer::Cancel) => {}
+            (Confirm::Tab(i), Answer::Discard) => self.force_close_tab(i),
+            (Confirm::Tab(i), Answer::Save) => {
+                self.switch_tab(i);
+                if self.save_current() {
+                    self.force_close_tab(self.active);
+                }
+            }
+            (Confirm::Quit, Answer::Discard) => {
+                self.allow_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            (Confirm::Quit, Answer::Save) => {
+                for i in unsaved {
+                    self.switch_tab(i);
+                    if !self.save_current() {
+                        self.status = "保存されなかったため終了を中止しました".into();
+                        return;
+                    }
+                }
+                self.allow_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
     }
 
@@ -1013,7 +1575,16 @@ impl App {
         self.poll_disk();
     }
 
+    /// Close a tab; asks first when it has unsaved changes.
     fn close_tab(&mut self, i: usize) {
+        if i < self.tabs.len() && self.tab_unsaved(i) {
+            self.confirm = Some(Confirm::Tab(i));
+            return;
+        }
+        self.force_close_tab(i);
+    }
+
+    fn force_close_tab(&mut self, i: usize) {
         if i >= self.tabs.len() {
             return;
         }
@@ -1038,10 +1609,10 @@ impl App {
 
     fn tab_title(&self, i: usize) -> String {
         let (path, dirty) = if i == self.active {
-            (self.doc.path.clone(), self.doc.dirty && !self.auto_save)
+            (self.doc.path.clone(), self.unsaved(&self.doc))
         } else {
             match &self.tabs[i] {
-                Some(t) => (t.doc.path.clone(), t.doc.dirty && !self.auto_save),
+                Some(t) => (t.doc.path.clone(), self.unsaved(&t.doc)),
                 None => (None, false),
             }
         };
@@ -1088,7 +1659,9 @@ impl App {
         }
         self.last_heartbeat = Instant::now();
         let p = crate::mcp::gui_heartbeat_path();
-        let _ = std::fs::create_dir_all(p.parent().unwrap());
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
         let _ = std::fs::write(&p, std::process::id().to_string());
     }
 
@@ -1244,15 +1817,26 @@ impl App {
         }
     }
 
-    fn save_as(&mut self) {
-        if let Some(p) = rfd::FileDialog::new().add_filter("Qucs schematic", &["sch"]).set_file_name("untitled.sch").save_file() {
-            self.doc.path = Some(p.clone());
-            match self.doc.save() {
-                Ok(_) => {
-                    self.disk_mtime = mtime(&p);
-                    self.status = format!("保存: {}", p.display());
-                }
-                Err(e) => self.status = e,
+    /// Ask for a file name and save there. False when cancelled or failed.
+    fn save_as(&mut self) -> bool {
+        let name = self.doc.path.as_ref().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "untitled.sch".into());
+        let Some(mut p) = rfd::FileDialog::new().add_filter("Qucs schematic", &["sch"]).set_file_name(name).save_file() else { return false };
+        if p.extension().is_none() {
+            p.set_extension("sch");
+        }
+        let old = self.doc.path.replace(p.clone());
+        match self.doc.save() {
+            Ok(_) => {
+                self.disk_mtime = mtime(&p);
+                self.status = format!("保存: {}", p.display());
+                self.settings.add_recent(&p);
+                self.settings.save();
+                true
+            }
+            Err(e) => {
+                self.doc.path = old;
+                self.status = format!("保存エラー: {e}");
+                false
             }
         }
     }
@@ -1341,23 +1925,33 @@ impl App {
 
     fn toolbar(&mut self, ui: &mut egui::Ui, canvas_hint: Rect) {
         ui.horizontal_wrapped(|ui| {
-            if ui.button("📂 開く").clicked() {
+            if ui.button("📂 開く").on_hover_text("Ctrl+O").clicked() {
                 self.open_dialog();
             }
-            if ui.button("💾 保存").on_hover_text("Ctrl+S").clicked() {
-                if self.doc.path.is_none() {
-                    self.save_as();
-                } else {
-                    match self.doc.save() {
-                        Ok(p) => {
-                            self.disk_mtime = mtime(&p);
-                            self.status = format!("保存: {}", p.display());
+            let recent = self.settings.existing_recent();
+            ui.add_enabled_ui(!recent.is_empty(), |ui| {
+                ui.menu_button("🕘 最近", |ui| {
+                    for p in &recent {
+                        let label = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                        if ui.button(label).on_hover_text(p.display().to_string()).clicked() {
+                            self.open_path(p);
+                            ui.close();
                         }
-                        Err(e) => self.status = e,
                     }
-                }
+                    ui.separator();
+                    if ui.button("履歴を消去").clicked() {
+                        self.settings.recent.clear();
+                        self.settings.save();
+                        ui.close();
+                    }
+                })
+                .response
+                .on_hover_text("最近使ったファイル");
+            });
+            if ui.button("💾 保存").on_hover_text("Ctrl+S").clicked() {
+                self.save_current();
             }
-            if ui.button("名前を付けて保存").clicked() {
+            if ui.button("名前を付けて保存").on_hover_text("Ctrl+Shift+S").clicked() {
                 self.save_as();
             }
             ui.separator();
@@ -1405,8 +1999,17 @@ impl App {
             }
             let pal = self.pal();
             let run = egui::Button::new(egui::RichText::new("▶ シミュレーション").color(pal.on_accent)).fill(pal.accent).stroke(Stroke::NONE);
-            if ui.add(run).clicked() {
+            if ui.add(run).on_hover_text("F5").clicked() {
                 self.run_sim();
+            }
+            let op_on = self.op_visible();
+            if ui.selectable_label(op_on, "⚡ 動作点").on_hover_text("DC 動作点を計算して、各ネットの電圧を回路図に表示").clicked() {
+                if op_on {
+                    self.op = None;
+                    self.op_window = false;
+                } else {
+                    self.run_op();
+                }
             }
             ui.menu_button("✏ 図形", |ui| {
                 for (k, label) in [("line", "線"), ("rect", "矩形"), ("ellipse", "楕円"), ("arrow", "矢印"), ("text", "テキスト (T)")] {
@@ -1425,6 +2028,31 @@ impl App {
                     self.mirror_y_selected();
                     ui.close();
                 }
+                if ui.button("検索… (Ctrl+F)").clicked() {
+                    self.find_open = true;
+                    self.find_focus = true;
+                    ui.close();
+                }
+                ui.separator();
+                let can_sub = !self.sel.is_empty() && self.doc.path.is_some();
+                if ui
+                    .add_enabled(can_sub, egui::Button::new("サブ回路を作成…"))
+                    .on_disabled_hover_text("部品を選択し、回路図を保存してから実行します")
+                    .on_hover_text("選択した部品を新しいサブ回路ファイルへ移し、Sub 部品で置き換える")
+                    .clicked()
+                {
+                    let used: std::collections::HashSet<String> = std::fs::read_dir(self.doc.dir().unwrap_or_default())
+                        .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().to_lowercase()).collect())
+                        .unwrap_or_default();
+                    let name = (1..).map(|k| format!("sub{k}.sch")).find(|n| !used.contains(n)).unwrap_or_else(|| "sub.sch".into());
+                    self.subckt_prompt = Some(name);
+                    ui.close();
+                }
+                let sub_sel = self.sel.len() == 1 && self.doc.sch.components.get(self.sel[0]).map(|c| c.typ == "Sub").unwrap_or(false);
+                if ui.add_enabled(sub_sel, egui::Button::new("サブ回路を開く")).on_hover_text("Sub 部品をダブルクリックしても開けます").clicked() {
+                    self.open_selected_sub();
+                    ui.close();
+                }
                 ui.separator();
                 for (m, label) in [("left", "左揃え"), ("right", "右揃え"), ("top", "上揃え"), ("bottom", "下揃え"), ("vcenter", "縦中心揃え"), ("hcenter", "横中心揃え"), ("distribute_h", "横に等間隔"), ("distribute_v", "縦に等間隔")] {
                     if ui.add_enabled(self.sel.len() >= 2, egui::Button::new(label)).clicked() {
@@ -1434,9 +2062,20 @@ impl App {
                 }
             });
             self.tools_menu(ui);
-            if ui.button("🖼 書き出し").on_hover_text("PNG / SVG").clicked() {
-                self.export_image();
-            }
+            ui.menu_button("🖼 書き出し", |ui| {
+                if ui.button("PNG / SVG…").clicked() {
+                    self.export_image();
+                    ui.close();
+                }
+                if ui.button("PDF…").clicked() {
+                    self.export_pdf();
+                    ui.close();
+                }
+                if ui.button("印刷… (Ctrl+P)").on_hover_text("PDF を作成して既定のビューアで開きます（ビューアから印刷）").clicked() {
+                    self.print();
+                    ui.close();
+                }
+            });
             if ui.button("⛶ 全体表示").on_hover_text("F").clicked() {
                 self.fit(canvas_hint);
             }
@@ -1445,11 +2084,14 @@ impl App {
             ch |= ui.checkbox(&mut self.color_nets, "ネット色").changed();
             ch |= ui.checkbox(&mut self.pin_names, "ピン名").changed();
             ch |= ui.checkbox(&mut self.show_issues, "問題表示").changed();
-            ui.checkbox(&mut self.show_grid, "グリッド");
-            ui.checkbox(&mut self.auto_reroute, "移動時に再配線");
-            ui.checkbox(&mut self.auto_save, "自動保存 (AI同期)").on_hover_text("編集を即座に保存し、MCP 側（AIエージェント）と同じファイルを共有します");
+            let mut other = ui.checkbox(&mut self.show_grid, "グリッド").changed();
+            other |= ui.checkbox(&mut self.auto_reroute, "移動時に再配線").changed();
+            other |= ui.checkbox(&mut self.auto_save, "自動保存 (AI同期)").on_hover_text("編集を即座に保存し、MCP 側（AIエージェント）と同じファイルを共有します").changed();
             if ch && self.show_issues {
                 self.issues = check::check(&self.doc.sch, &self.conn).issues;
+            }
+            if ch || other {
+                self.store_settings();
             }
         });
     }
@@ -1594,7 +2236,7 @@ impl App {
             }
             ui.separator();
             ui.label("ショートカット");
-            ui.small("Ctrl+C/X/V/D コピー/切り取り/貼り付け/複製\nCtrl+A 全選択 / Y Y軸ミラー / T テキスト\nR 回転 / M ミラー / Del 削除\nW 配線 / A 自動配線 / L ラベル\nCtrl+Z/Y 元に戻す/やり直し\nホイール: ズーム, 中/右ドラッグ: パン\nF 全体表示");
+            ui.small("Ctrl+C/X/V/D コピー/切り取り/貼り付け/複製\nCtrl+A 全選択 / Y Y軸ミラー / T テキスト\nR 回転 / M ミラー / Del 削除\nW 配線 / A 自動配線 / L ラベル\nCtrl+Z/Y 元に戻す/やり直し\nCtrl+S 保存 / Ctrl+Shift+S 名前を付けて保存\nCtrl+F 検索 / Ctrl+P 印刷 / F5 シミュレーション\nホイール・Ctrl +/-: ズーム, 中/右ドラッグ: パン\nF・Ctrl+0 全体表示 / F1 バージョン情報");
             return;
         }
         let ci = self.sel[0];
@@ -1619,6 +2261,10 @@ impl App {
             }
         });
         ui.label(format!("位置 ({}, {})  回転 {}  ミラー {}", c.x, c.y, c.rotate, c.mirror));
+        if c.typ == "Sub" && ui.button("⤵ サブ回路を開く").on_hover_text("ダブルクリックでも開けます").clicked() {
+            self.open_selected_sub();
+            return;
+        }
         ui.horizontal(|ui| {
             if ui.button("⟲ 回転 (R)").clicked() {
                 self.rotate_selected();
@@ -2167,6 +2813,7 @@ impl App {
     fn canvas(&mut self, ui: &mut egui::Ui) {
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let canvas = resp.rect;
+        self.canvas_rect = canvas;
         painter.rect_filled(canvas, 0.0, self.pal().canvas);
         self.rebuild_scene();
         if self.need_fit {
@@ -2199,6 +2846,7 @@ impl App {
         let shapes = std::mem::take(&mut self.scene.shapes);
         self.paint_shapes(&painter, canvas, &shapes, 1.0);
         self.scene.shapes = shapes;
+        self.paint_op(&painter, canvas);
 
         let pointer = hover.map(|h| self.to_sch_f(canvas, h));
         match self.tool.clone() {
@@ -2245,11 +2893,11 @@ impl App {
                     let cur = (snap(px.round() as i32), snap(py.round() as i32));
                     if let Some(&last) = self.wire_pts.last() {
                         let mid = (cur.0, last.1);
-                        let s = Stroke::new(2.0, self.pal().accent);
+                        let s = Stroke::new(2.0_f32, self.pal().accent);
                         painter.line_segment([self.to_screen(canvas, last.0 as f64, last.1 as f64), self.to_screen(canvas, mid.0 as f64, mid.1 as f64)], s);
                         painter.line_segment([self.to_screen(canvas, mid.0 as f64, mid.1 as f64), self.to_screen(canvas, cur.0 as f64, cur.1 as f64)], s);
                     }
-                    painter.circle_stroke(self.to_screen(canvas, cur.0 as f64, cur.1 as f64), 4.0, Stroke::new(1.0, self.pal().accent));
+                    painter.circle_stroke(self.to_screen(canvas, cur.0 as f64, cur.1 as f64), 4.0, Stroke::new(1.0_f32, self.pal().accent));
                     if resp.double_clicked() || resp.secondary_clicked() {
                         self.finish_wire();
                     } else if resp.clicked() {
@@ -2268,7 +2916,7 @@ impl App {
                 if let Some((px, py)) = pointer {
                     if let Some(pin) = self.pin_at(px, py) {
                         if let Some(p) = self.conn.find_pin(&pin) {
-                            painter.circle_stroke(self.to_screen(canvas, p.x as f64, p.y as f64), 7.0, Stroke::new(2.0, self.pal().accent_hi));
+                            painter.circle_stroke(self.to_screen(canvas, p.x as f64, p.y as f64), 7.0, Stroke::new(2.0_f32, self.pal().accent_hi));
                             painter.text(self.to_screen(canvas, p.x as f64, p.y as f64) + Vec2::new(8.0, -18.0), Align2::LEFT_TOP, &pin, FontId::proportional(13.0), self.pal().accent_hi);
                         }
                         if resp.clicked() {
@@ -2287,7 +2935,7 @@ impl App {
                     }
                     if let Some(a) = &self.autowire_first {
                         if let Some(p) = self.conn.find_pin(a) {
-                            painter.line_segment([self.to_screen(canvas, p.x as f64, p.y as f64), hover.unwrap()], Stroke::new(1.0, self.pal().accent_hi));
+                            painter.line_segment([self.to_screen(canvas, p.x as f64, p.y as f64), hover.unwrap()], Stroke::new(1.0_f32, self.pal().accent_hi));
                         }
                     }
                 }
@@ -2310,7 +2958,7 @@ impl App {
                         if let Some(st) = self.paint_start {
                             let a = self.to_screen(canvas, st.0 as f64, st.1 as f64);
                             let b = self.to_screen(canvas, cur.0 as f64, cur.1 as f64);
-                            let s = Stroke::new(1.5, self.pal().accent);
+                            let s = Stroke::new(1.5_f32, self.pal().accent);
                             match kind.as_str() {
                                 "rect" => {
                                     painter.rect_stroke(Rect::from_two_pos(a, b), 0.0, s, egui::StrokeKind::Inside);
@@ -2411,6 +3059,11 @@ impl App {
         }
         if resp.double_clicked() {
             if let Some((px, py)) = pointer {
+                if let Some(ci) = self.comp_at(px, py).filter(|&ci| self.doc.sch.components[ci].typ == "Sub") {
+                    self.sel = vec![ci];
+                    self.open_selected_sub();
+                    return;
+                }
                 if let Some(pi) = crate::edit::painting_at(&self.doc, px, py) {
                     let line = &self.doc.sch.paintings[pi];
                     if line.trim_start().starts_with("<Text") {
@@ -2425,7 +3078,7 @@ impl App {
         for &k in &self.sel_paint {
             if let Some(b) = self.doc.sch.paintings.get(k).and_then(|p| crate::edit::painting_bbox(p)) {
                 let r = Rect::from_two_pos(self.to_screen(canvas, b[0] - 3.0, b[1] - 3.0), self.to_screen(canvas, b[2] + 3.0, b[3] + 3.0));
-                painter.rect_stroke(r, 2.0, Stroke::new(1.5, self.pal().accent_hi), egui::StrokeKind::Outside);
+                painter.rect_stroke(r, 2.0, Stroke::new(1.5_f32, self.pal().accent_hi), egui::StrokeKind::Outside);
             }
         }
         if resp.drag_started_by(egui::PointerButton::Primary) {
@@ -2537,7 +3190,7 @@ impl App {
         if let Some(b) = self.box_start {
             if let Some(h) = resp.hover_pos().or(resp.interact_pointer_pos()) {
                 let r = Rect::from_two_pos(b, h);
-                painter.rect_stroke(r, 0.0, Stroke::new(1.0, self.pal().accent), egui::StrokeKind::Inside);
+                painter.rect_stroke(r, 0.0, Stroke::new(1.0_f32, self.pal().accent), egui::StrokeKind::Inside);
                 painter.rect_filled(r, 0.0, self.pal().accent.gamma_multiply(0.12));
             }
         }
@@ -2713,13 +3366,40 @@ impl App {
             return;
         }
         if ctrl && pressed(egui::Key::S) {
-            match self.doc.save() {
-                Ok(p) => {
-                    self.disk_mtime = mtime(&p);
-                    self.status = format!("保存: {}", p.display());
-                }
-                Err(_) => self.save_as(),
+            if ctx.input(|i| i.modifiers.shift) {
+                self.save_as();
+            } else {
+                self.save_current();
             }
+            return;
+        }
+        if ctrl && pressed(egui::Key::F) {
+            self.find_open = true;
+            self.find_focus = true;
+            return;
+        }
+        if ctrl && pressed(egui::Key::P) {
+            self.print();
+            return;
+        }
+        if ctrl && (pressed(egui::Key::Plus) || pressed(egui::Key::Equals)) {
+            self.zoom_by(1.25);
+            return;
+        }
+        if ctrl && pressed(egui::Key::Minus) {
+            self.zoom_by(0.8);
+            return;
+        }
+        if ctrl && pressed(egui::Key::Num0) {
+            self.fit(canvas);
+            return;
+        }
+        if pressed(egui::Key::F5) {
+            self.run_sim();
+            return;
+        }
+        if pressed(egui::Key::F1) {
+            self.about_open = true;
             return;
         }
         if ctrl {
@@ -2768,6 +3448,23 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && (0..self.tabs.len()).any(|i| self.tab_unsaved(i)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm = Some(Confirm::Quit);
+        }
+        // remember the window geometry for the next start
+        ctx.input(|i| {
+            let vp = i.viewport();
+            if let Some(m) = vp.maximized {
+                self.settings.maximized = m;
+            }
+            if !self.settings.maximized {
+                if let (Some(o), Some(r)) = (vp.outer_rect, vp.inner_rect) {
+                    self.settings.window = Some([o.min.x, o.min.y, r.width(), r.height()]);
+                }
+            }
+        });
+        self.poll_op();
         self.poll_disk();
         self.poll_open_requests();
         self.heartbeat();
@@ -2801,7 +3498,7 @@ impl eframe::App for App {
         let title = format!(
             "Qucs-S RS — {}{}",
             self.doc.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "無題".into()),
-            if self.doc.dirty && !self.auto_save { " *" } else { "" }
+            if self.unsaved(&self.doc) { " *" } else { "" }
         );
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
 
@@ -2815,7 +3512,7 @@ impl eframe::App for App {
 
         let screen = ctx.content_rect();
         let pal = self.pal();
-        let bar = egui::Frame::new().fill(pal.bar).inner_margin(egui::Margin::symmetric(10, 6)).stroke(egui::Stroke::new(1.0, pal.border));
+        let bar = egui::Frame::new().fill(pal.bar).inner_margin(egui::Margin::symmetric(10, 6)).stroke(egui::Stroke::new(1.0_f32, pal.border));
         egui::TopBottomPanel::top("toolbar").frame(bar).show(ctx, |ui| self.toolbar(ui, screen));
         egui::TopBottomPanel::top("tabs").frame(egui::Frame::new().fill(pal.bar).inner_margin(egui::Margin::symmetric(10, 3))).show(ctx, |ui| self.tab_bar(ui));
         egui::TopBottomPanel::bottom("status").frame(bar.inner_margin(egui::Margin::symmetric(10, 3))).show(ctx, |ui| {
@@ -2828,6 +3525,9 @@ impl eframe::App for App {
                     self.show_sim = true;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("ⓘ").on_hover_text("バージョン情報 (F1)").clicked() {
+                        self.about_open = true;
+                    }
                     self.theme_menu(ui);
                     let errs = self.issues.iter().filter(|i| i.severity == "error").count();
                     let warns = self.issues.len() - errs;
@@ -2869,8 +3569,10 @@ impl eframe::App for App {
                 });
             });
         }
-        egui::SidePanel::left("palette").default_width(230.0).show(ctx, |ui| self.palette(ui));
-        egui::SidePanel::right("props").default_width(290.0).show(ctx, |ui| self.properties(ui));
+        let lw = egui::SidePanel::left("palette").default_width(self.settings.left_panel).show(ctx, |ui| self.palette(ui)).response.rect.width();
+        let rw = egui::SidePanel::right("props").default_width(self.settings.right_panel).show(ctx, |ui| self.properties(ui)).response.rect.width();
+        self.settings.left_panel = lw;
+        self.settings.right_panel = rw;
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
             let canvas = ui.max_rect();
             self.keys(ctx, canvas);
@@ -2879,6 +3581,11 @@ impl eframe::App for App {
         self.sim_window(ctx);
         self.tool_windows(ctx);
         self.mc_window(ctx);
+        self.op_window(ctx);
+        self.find_window(ctx);
+        self.about_window(ctx);
+        self.subckt_dialog(ctx);
+        self.confirm_dialog(ctx);
         if let Some((pos, mut text, editing)) = self.text_prompt.take() {
             let mut done = false;
             let mut cancel = false;
@@ -2938,6 +3645,7 @@ impl eframe::App for App {
                 self.label_prompt = Some((t, text));
             }
         }
+        self.drive_shot(ctx);
         // keep polling the file even when idle
         ctx.request_repaint_after(std::time::Duration::from_millis(350));
     }
@@ -2945,6 +3653,7 @@ impl eframe::App for App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.store_settings();
         // no longer accepting files: let the next launch open its own window
         let _ = std::fs::remove_file(crate::mcp::gui_heartbeat_path());
     }

@@ -2,6 +2,8 @@
 
 **Qucs-S の Rust 製フォーク（軽量回路図エディタ）＋ AI エージェント用 MCP サーバー**
 
+[English README](README.en.md) ・ [MCP ツールリファレンス](docs/mcp-tools.md) ・ [変更履歴](CHANGELOG.md)
+
 Python 版 [qucs-s-mcp](../20261119_Qucs-S-mcp) では「AI が見ている画像」と「Qucs-S の実際の描画」が別物で、
 配線もエージェント任せだったため、回路図がスパゲッティになりがちでした。qucs-s-rs はエディタ本体を Rust で作り直し、
 
@@ -29,12 +31,25 @@ Python 版 [qucs-s-mcp](../20261119_Qucs-S-mcp) では「AI が見ている画�
 
 ## 必要環境
 
-* Windows 11（Linux / macOS でもビルド可能。GUI フォントのパスのみ OS 依存）
+* Windows 11（Linux / macOS でもビルド・CI 済み。日本語フォントは Noto CJK / ヒラギノ等を自動検出）
 * Rust 1.94 以上（ビルド時のみ）
-* シミュレーションを使う場合: [Qucs-S](https://ra3xdh.github.io/)（ネットリスト生成に使用）と ngspice  
-  既定の場所（`C:\Program Files\Qucs-S`, `C:\Spice64\bin`）か PATH から自動検出。別の場所なら `QUCS_S_PATH` / `NGSPICE_PATH`
+* シミュレーションを使う場合: [ngspice](https://ngspice.sourceforge.io/)  
+  既定の場所（`C:\Spice64\bin`）か PATH から自動検出。別の場所なら `NGSPICE_PATH`
+* [Qucs-S](https://ra3xdh.github.io/) は**任意**。ネットリストは内蔵のネットリスタが生成し、内蔵で扱えない部品・解析
+  （パラメータスイープ、Qucs の `Eqn`、HB、ノイズ、Verilog-A、Lib 部品など）があるときだけ Qucs-S を使います（`QUCS_S_PATH`）
 
-描画・編集・配線・チェックは Qucs-S 無しで動きます。
+描画・編集・配線・チェック・TR/AC/DC シミュレーションは Qucs-S 無しで動きます。
+
+### 内蔵ネットリスタ
+
+Qucs-S の `spice_netlist()` と同じ変換規則を Rust に移植したもので、出力は `qucs-s -n --ngspice` と同等です
+（`tests/netlist_parity.py` で両者のシミュレーション結果が一致することを確認）。
+
+* 解析: `.TR`（lin）、`.AC`（lin / log）、`.DC`（動作点）、`NutmegEq`（`let` 式）、`SpicePar`（`.PARAM`）
+* 部品: R / L / C、GND、Vdc / Idc / Vac / Iac / Vpulse / Ipulse / Vrect / Irect、ダイオード、BJT、MOSFET、JFET、
+  オペアンプ、VCVS / VCCS / CCVS / CCCS、電流・電圧プローブ、B ソース（`S4Q_Ieqndef` / `src_eqndef` / `S4Q_V` / `S4Q_I`）、
+  サブ回路（`Sub` + `Port`、入れ子可）
+* 切り替え: `QUCS_RS_NETLISTER=auto`（既定）/ `builtin` / `qucs-s`。MCP の `get_component_type` は `builtin_netlist` で対応可否を返す
 
 ## ビルド
 
@@ -42,7 +57,16 @@ Python 版 [qucs-s-mcp](../20261119_Qucs-S-mcp) では「AI が見ている画�
 cargo build --release
 ```
 
-`target\release\qucs-s-rs.exe`（単一ファイル、約 10 MB）ができます。
+`target\release\qucs-s-rs.exe`（単一ファイル、約 10 MB、アイコン・バージョン情報入り）ができます。
+
+### インストール（ユーザー単位・管理者権限不要）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\install.ps1             # %LOCALAPPDATA%\Programs\qucs-s-rs とスタートメニュー
+powershell -ExecutionPolicy Bypass -File tools\install.ps1 -Associate  # .sch の「プログラムから開く」にも登録
+powershell -ExecutionPolicy Bypass -File tools\uninstall.ps1           # 削除（-Purge で設定も削除）
+powershell -ExecutionPolicy Bypass -File tools\package.ps1             # 配布用 zip を dist\ に作成
+```
 
 ## 使い方
 
@@ -53,7 +77,12 @@ cargo build --release
 ```
 
 * 左: 部品パレット（検索可）、右: プロパティ編集、上: ツールバー
-* 操作: ホイールでズーム、中／右ドラッグでパン、ドラッグで移動（移動後に自動再配線）、`R` 回転、`M` ミラー、`Del` 削除、`W` 手配線、`A` 自動配線（ピンを 2 つクリック）、`L` ネットラベル、`F` 全体表示、`Ctrl+Z / Ctrl+Y / Ctrl+S`
+* 操作: ホイール・`Ctrl +/-` でズーム、中／右ドラッグでパン、ドラッグで移動（移動後に自動再配線）、`R` 回転、`M` ミラー、`Del` 削除、`W` 手配線、`A` 自動配線（ピンを 2 つクリック）、`L` ネットラベル、`F` / `Ctrl+0` 全体表示、`Ctrl+Z / Ctrl+Y`、`Ctrl+S` 保存 / `Ctrl+Shift+S` 名前を付けて保存、`Ctrl+F` 検索（部品名・種類・値・ネット名）、`Ctrl+P` 印刷、`F5` シミュレーション、`F1` バージョン情報
+* 未保存の変更があるタブやウィンドウを閉じると「保存 / 保存しない / キャンセル」を確認（自動保存 OFF のときや無題の回路図）
+* 設定（表示の切り替え、自動保存、ウィンドウ位置・サイズ、パネル幅）と「🕘 最近」のファイル履歴は `%APPDATA%\qucs-s-rs\settings.json` に保存
+* ⚡ 動作点: DC 動作点を計算し、各ネットの電圧を回路図上にタグ表示（電源・プローブの電流も一覧）。回路を編集すると自動で消える
+* 階層設計: 部品を選んで「✂ 編集 → サブ回路を作成…」で、選択部分を新しい .sch（外へつながるネットごとに Port）へ移し、`Sub` 部品で置き換えて配線し直す。`Sub` をダブルクリック（またはプロパティの「⤵ サブ回路を開く」）で中を開く
+* 🖼 書き出し: PNG / SVG / PDF（A4）。印刷は PDF を既定のビューアで開いて行う
 * 「自動保存 (AI同期)」が ON のとき、編集は即座に .sch に保存され、MCP 側（AI）は次のツール呼び出しで自動的に読み直します。逆に AI の編集はエディタに即時反映されます
 * ⟲ 全再配線 / ✨ 整頓 / 🔍 チェック / ▶ シミュレーション
 * 部品パレットは「部品」（220 種の組み込み部品）と「ライブラリ」（Qucs-S 付属の 70 ライブラリ・約 4,200 の実部品）のタブ。どちらもシンボルのアイコン付き
@@ -110,9 +139,12 @@ Claude Desktop など:
 | 配線 | `connect`（複数ネットを一括、ラベル付与、ピンスワップ、改善パス） `add_wire` `delete_wires` `add_net_label` `reroute` `tidy` |
 | 図形 | `add_painting`（線・矩形・楕円・矢印・テキスト） `delete_paintings` |
 | 見る | `snapshot`（PNG。グリッド＋座標ルーラー、ネット色分けと名前、ピン名、問題マーカー、ハイライト、領域ズーム、`clean` で報告用） `check_layout` |
-| シミュレーション | `add_simulation` `add_parameter_sweep` `run_monte_carlo`（部品値のばらつき、統計・歩留まり・重ね描き・ヒストグラム） `get_netlist` `run_simulation` `get_results`（指定点の補間値・表） `plot_results`（直交・極座標・スミス・表、マーカー値を数値でも返す） |
+| 階層 | `create_subcircuit`（部品をサブ回路ファイルへ移し Sub で置換、ポートを自動生成） `open_subcircuit`（Sub の中へ） |
+| シミュレーション | `add_simulation` `add_parameter_sweep` `run_monte_carlo`（部品値のばらつき、統計・歩留まり・重ね描き・ヒストグラム） `get_netlist`（`netlister` 指定可） `run_simulation` `dc_operating_point`（全ネット電圧・枝電流） `get_results`（指定点の補間値・表） `plot_results`（直交・極座標・スミス・表、マーカー値を数値でも返す） |
 | 設計ツール | `design_filter`（LC フィルタ合成→配置・配線、テスト回路付き） `design_attenuator` `calc_transmission_line`（マイクロストリップ / 同軸） |
 | エディタ連携 | `open_gui`（ユーザーにライブ表示） `get_gui_state`（ユーザーが選択中の部品・表示範囲） |
+
+全ツールの引数は [docs/mcp-tools.md](docs/mcp-tools.md)（`python tools\gen_mcp_docs.py` でサーバーから再生成）。
 
 座標は Qucs と同じ（x 右、**y 下**、10 グリッド）。端子指定は `"R1.1"` `"V1.+"` `"OP1.OUT"`、座標 `"[x,y]"`、ネット `"net:vcc"`。
 
@@ -124,6 +156,10 @@ Claude Desktop など:
 qucs-s-rs render in.sch out.png [--overlay] [--pins] [--scale 2]   # PNG / SVG 出力
 qucs-s-rs check in.sch                                              # レイアウト検査 (JSON)
 qucs-s-rs reroute in.sch [out.sch]                                  # 全ネット再配線
+qucs-s-rs netlist in.sch [--qucs-s]                                 # ngspice ネットリスト
+qucs-s-rs simulate in.sch                                           # シミュレーション (JSON 要約)
+qucs-s-rs op in.sch                                                 # DC 動作点 (JSON)
+qucs-s-rs --version
 ```
 
 ## 構成
@@ -139,7 +175,11 @@ src/
   render.rs     共通シーン → egui / SVG / PNG(resvg)
   gui.rs        エディタ (egui)
   mcp.rs        MCP サーバー (stdio JSON-RPC)
-  sim.rs        qucs-s でネットリスト → ngspice → raw 解析
+  sim.rs        ネットリスト（内蔵 / qucs-s） → ngspice → raw 解析、DC 動作点
+  spice.rs      内蔵ネットリスタ（Qucs-S の変換規則を移植、サブ回路対応）
+  hier.rs       階層設計（選択からサブ回路を作成、Sub のファイル解決）
+  settings.rs   設定と最近使ったファイル
+  pdf.rs        PDF 書き出し・印刷
   diagram.rs    結果ダイアグラム（直交・極座標・スミス・表、マーカー）
   qlib.rs       Qucs-S ライブラリ（.lib）とサブ回路の <Symbol> 読み込み
   edit.rs       クリップボード、複製、整列、図形
@@ -164,12 +204,17 @@ python tools\extract_symbols.py ..\qucs_s_src_ref\qucs_s data\components.json da
 ## テスト
 
 ```powershell
-cargo test                                # パーサ往復、ピン位置、接続解析、ルーター
+cargo test                                # パーサ往復、接続規則、編集と Undo、ルーター、内蔵ネットリスタ、サブ回路、PDF、設定
+python tests\netlist_parity.py            # 内蔵ネットリスタと qucs-s の結果が一致するか（Qucs-S と ngspice が必要）
 python tests\e2e_mcp.py                   # MCP クライアントとして回路作成〜シミュレーションまで
 python tests\live_sync.py                 # エディタを開いたまま MCP で編集し、追従を確認
 python tests\e2e_mc.py                   # モンテカルロ解析
 python tests\e2e_features.py             # ライブラリ部品・フィルタ合成・マーカー・スイープ・編集ツール
 ```
+
+GUI の確認用に、`QUCS_RS_SHOT=out.png`（と `QUCS_RS_SHOT_ACTIONS=op,find:R1,about,quit`）を付けて起動すると、
+その状態のウィンドウを PNG に保存して終了します。CI（GitHub Actions）は Windows / Linux / macOS で clippy・テスト・ビルドと、
+Linux の ngspice で内蔵ネットリスタによるシミュレーションを実行します。
 
 ## ライセンス
 

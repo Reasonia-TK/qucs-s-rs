@@ -6,17 +6,22 @@ mod diagram;
 mod doc;
 mod edit;
 mod gui;
+mod hier;
+mod icon_pixels;
 mod library;
 mod mcp;
 mod montecarlo;
 mod netlist;
+mod pdf;
 mod plot;
 mod qlib;
 mod render;
 mod rftools;
 mod router;
 mod schematic;
+mod settings;
 mod sim;
+mod spice;
 mod synth;
 mod theme;
 
@@ -30,7 +35,11 @@ fn usage() -> ! {
          qucs-s-rs mcp                       run the MCP server on stdio\n  \
          qucs-s-rs render <in.sch> <out.png|out.svg> [--overlay] [--scale S]\n  \
          qucs-s-rs check <in.sch>            layout report (JSON)\n  \
-         qucs-s-rs reroute <in.sch> [out.sch] rip-up and re-route all nets",
+         qucs-s-rs reroute <in.sch> [out.sch] rip-up and re-route all nets
+           qucs-s-rs netlist <in.sch> [--qucs-s] print the ngspice netlist
+           qucs-s-rs simulate <in.sch>         run the simulations (JSON summary)
+           qucs-s-rs op <in.sch>               DC operating point (JSON)
+           qucs-s-rs --version",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2)
@@ -76,7 +85,7 @@ fn main() {
             let d = doc::Doc::open(&PathBuf::from(&args[1])).unwrap_or_else(|e| fail(&e));
             let rep = check::check(&d.sch, &d.conn());
             let v = serde_json::json!({"metrics": rep.metrics, "issues": rep.issues.iter().enumerate().map(|(k, i)| i.json(k + 1)).collect::<Vec<_>>()});
-            println!("{}", serde_json::to_string_pretty(&v).unwrap());
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         }
         "reroute" => {
             if args.len() < 2 {
@@ -88,6 +97,30 @@ fn main() {
             d.sch.save(&out).unwrap_or_else(|e| fail(&e));
             println!("{r}");
         }
+        "netlist" => {
+            if args.len() < 2 {
+                usage();
+            }
+            let p = PathBuf::from(&args[1]);
+            let out = std::env::temp_dir().join("qucs-s-rs").join("cli_netlist.cir");
+            let net = if args.iter().any(|a| a == "--qucs-s") { sim::netlist_qucs_s(&p, &out) } else { sim::netlist(&p, &out) };
+            print!("{}", net.unwrap_or_else(|e| fail(&e)));
+        }
+        "simulate" => {
+            if args.len() < 2 {
+                usage();
+            }
+            let r = sim::simulate(&PathBuf::from(&args[1]), 300).unwrap_or_else(|e| fail(&e));
+            println!("{}", serde_json::to_string_pretty(&r.summary()).unwrap_or_default());
+        }
+        "op" => {
+            if args.len() < 2 {
+                usage();
+            }
+            let op = sim::operating_point(&PathBuf::from(&args[1]), 120).unwrap_or_else(|e| fail(&e));
+            println!("{}", serde_json::to_string_pretty(&op.json()).unwrap_or_default());
+        }
+        "-V" | "--version" | "version" => println!("qucs-s-rs {}", env!("CARGO_PKG_VERSION")),
         "-h" | "--help" | "help" => usage(),
         "gui" => gui::run(args.get(1).map(PathBuf::from)),
         other if other.ends_with(".sch") => gui::run(Some(PathBuf::from(other))),
@@ -167,3 +200,6 @@ mod tests {
         assert!(d.sch.wires.iter().all(|w| w.is_horizontal() || w.is_vertical()));
     }
 }
+
+#[cfg(test)]
+mod core_tests;

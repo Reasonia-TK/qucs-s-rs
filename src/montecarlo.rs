@@ -144,9 +144,8 @@ fn tolerance(spec: &McSpec, name: &str) -> f64 {
 
 /// Run the Monte Carlo analysis for a saved schematic.
 pub fn run(sch_path: &Path, spec: &McSpec) -> Result<McResult, String> {
-    let sch_path = sch_path.canonicalize().map_err(|e| format!("{}: {e}", sch_path.display()))?;
-    let stem = sch_path.file_stem().unwrap().to_string_lossy().to_string();
-    let base = sch_path.parent().unwrap().join(format!("{stem}_mc"));
+    let sch_path = sim::canonical(sch_path)?;
+    let (base, stem) = sim::work_dir(&sch_path, "mc")?;
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
     let net = sim::netlist(&sch_path, &base.join("nominal.cir"))?;
@@ -200,16 +199,16 @@ pub fn run(sch_path: &Path, spec: &McSpec) -> Result<McResult, String> {
         let results = results.clone();
         let tmo = spec.timeout_s;
         hs.push(std::thread::spawn(move || loop {
-            let job = jobs.lock().unwrap().pop();
+            let job = jobs.lock().unwrap_or_else(|e| e.into_inner()).pop();
             let Some((k, dir, cir, text)) = job else { break };
             let r = sim::run_netlist(&text, &dir, &cir, tmo);
-            results.lock().unwrap().push((k, r));
+            results.lock().unwrap_or_else(|e| e.into_inner()).push((k, r));
         }));
     }
     for h in hs {
         let _ = h.join();
     }
-    let mut runs_out = std::mem::take(&mut *results.lock().unwrap());
+    let mut runs_out = std::mem::take(&mut *results.lock().unwrap_or_else(|e| e.into_inner()));
     runs_out.sort_by_key(|r| r.0);
     let summary = summarize(&runs_out, &params, spec, &varied.iter().map(|v| (v.1.clone(), tolerance(spec, &v.1))).collect::<Vec<_>>());
     Ok(McResult { runs: runs_out, summary })
@@ -250,7 +249,7 @@ fn stats(xs: &[f64]) -> Value {
     let mean = xs.iter().sum::<f64>() / n;
     let sd = (xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0).max(1.0)).sqrt();
     let mut s = xs.to_vec();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    s.sort_by(|a, b| a.total_cmp(b));
     let pct = |p: f64| s[((p * (s.len() - 1) as f64).round() as usize).min(s.len() - 1)];
     let g = |x: f64| (x * 1e6).round() / 1e6;
     json!({"n": xs.len(), "mean": g(mean), "std": g(sd), "min": g(s[0]), "max": g(*s.last().unwrap()), "p01": g(pct(0.01)), "p50": g(pct(0.5)), "p99": g(pct(0.99))})

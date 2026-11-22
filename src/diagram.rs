@@ -1351,7 +1351,7 @@ mod tests {
         parses(&out.svg);
         let m = &out.markers[0];
         let mag = m["value"]["mag"].as_f64().unwrap();
-        assert!((mag - 0.7071).abs() < 0.003, "mag {mag}");
+        assert!((mag - std::f64::consts::FRAC_1_SQRT_2).abs() < 0.003, "mag {mag}");
         assert!((m["value"]["db"].as_f64().unwrap() + 3.01).abs() < 0.05);
         assert!((m["value"]["phase_deg"].as_f64().unwrap() + 45.0).abs() < 0.5);
         let pa = out.plot_area.unwrap();

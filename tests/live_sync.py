@@ -2,7 +2,7 @@
 import json, subprocess, sys, time, os
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
-EXE = ROOT / "target" / "debug" / "qucs-s-rs.exe"
+EXE = Path(os.environ["QUCS_RS_EXE"]) if os.environ.get("QUCS_RS_EXE") else ROOT / "target" / "debug" / "qucs-s-rs.exe"
 OUT = ROOT / "target" / "e2e"
 p = subprocess.Popen([str(EXE), "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env={**os.environ, "QUCS_MCP_WORKDIR": str(OUT)})
 n = 0

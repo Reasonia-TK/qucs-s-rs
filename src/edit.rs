@@ -137,7 +137,7 @@ pub fn align(doc: &Doc, comps: &[usize], mode: &str) -> Result<Vec<(String, i32,
             let h = mode == "distribute_h";
             let mut order: Vec<usize> = (0..comps.len()).collect();
             let center = |b: &[f64; 4]| if h { (b[0] + b[2]) / 2.0 } else { (b[1] + b[3]) / 2.0 };
-            order.sort_by(|&a, &b| center(&bb[a]).partial_cmp(&center(&bb[b])).unwrap());
+            order.sort_by(|&a, &b| center(&bb[a]).total_cmp(&center(&bb[b])));
             let first = center(&bb[order[0]]);
             let last = center(&bb[*order.last().unwrap()]);
             let step = (last - first) / (order.len() - 1) as f64;

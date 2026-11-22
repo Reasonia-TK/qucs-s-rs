@@ -122,7 +122,7 @@ pub fn parse_lib_file(path: &Path) -> Option<LibFile> {
     if !first.starts_with("<Qucs Library") {
         return None;
     }
-    let name = first.split('"').nth(1).map(|s| s.to_string()).unwrap_or_else(|| path.file_stem().unwrap().to_string_lossy().to_string());
+    let name = first.split('"').nth(1).map(|s| s.to_string()).unwrap_or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
     let mut comps = Vec::new();
     let mut rest: &str = &text;
     while let Some(i) = rest.find("<Component ") {
@@ -285,14 +285,14 @@ pub fn parse_symbol<'a>(lines: impl Iterator<Item = &'a str>) -> ParsedSymbol {
             .iter()
             .map(|t| (((t.0 - q[0]).powi(2) + (t.1 - q[1]).powi(2)).sqrt(), &t.2))
             .filter(|(d, _)| *d < 32.0)
-            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            .min_by(|a, b| a.0.total_cmp(&b.0));
         if let Some((_, name)) = best {
             // must be closest to this port than to any other port, and unique
             let nearest_port = ports.iter().enumerate().min_by(|a, b| {
                 let t = texts.iter().find(|t| &t.2 == name).unwrap();
                 let da = (t.0 - a.1[0]).powi(2) + (t.1 - a.1[1]).powi(2);
                 let db = (t.0 - b.1[0]).powi(2) + (t.1 - b.1[1]).powi(2);
-                da.partial_cmp(&db).unwrap()
+                da.total_cmp(&db)
             });
             if nearest_port.map(|n| n.0) == Some(i) && !used.contains(name) && name.parse::<usize>().is_err() {
                 pin_names[i] = name.clone();

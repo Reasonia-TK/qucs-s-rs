@@ -191,7 +191,7 @@ impl Palette {
     pub fn map_image(&self, rgba: &[u8]) -> Vec<u8> {
         let mut out = rgba.to_vec();
         let mut cache: std::collections::HashMap<[u8; 3], [u8; 3]> = std::collections::HashMap::new();
-        for px in out.chunks_exact_mut(4) {
+        for px in out.as_chunks_mut::<4>().0 {
             let a = px[3];
             if a == 0 {
                 continue;
@@ -211,7 +211,7 @@ impl Palette {
         let r = CornerRadius::same(5);
         v.panel_fill = self.panel;
         v.window_fill = self.bg;
-        v.window_stroke = Stroke::new(1.0, self.border);
+        v.window_stroke = Stroke::new(1.0_f32, self.border);
         v.window_corner_radius = CornerRadius::same(8);
         v.window_shadow = Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(if self.dark { 140 } else { 40 }) };
         v.popup_shadow = Shadow { offset: [0, 4], blur: 14, spread: 0, color: Color32::from_black_alpha(if self.dark { 120 } else { 30 }) };
@@ -223,42 +223,42 @@ impl Palette {
         v.warn_fg_color = self.warn;
         v.error_fg_color = self.error;
         v.selection.bg_fill = self.accent_bg;
-        v.selection.stroke = Stroke::new(1.0, self.accent);
-        v.text_cursor.stroke = Stroke::new(2.0, self.accent);
+        v.selection.stroke = Stroke::new(1.0_f32, self.accent);
+        v.text_cursor.stroke = Stroke::new(2.0_f32, self.accent);
         v.striped = false;
         v.slider_trailing_fill = true;
 
         let w = &mut v.widgets;
         w.noninteractive.bg_fill = self.panel;
         w.noninteractive.weak_bg_fill = self.panel;
-        w.noninteractive.bg_stroke = Stroke::new(1.0, self.border);
-        w.noninteractive.fg_stroke = Stroke::new(1.0, self.fg);
+        w.noninteractive.bg_stroke = Stroke::new(1.0_f32, self.border);
+        w.noninteractive.fg_stroke = Stroke::new(1.0_f32, self.fg);
         w.noninteractive.corner_radius = r;
 
         w.inactive.bg_fill = self.raised;
         w.inactive.weak_bg_fill = self.raised;
-        w.inactive.bg_stroke = Stroke::new(1.0, self.border);
-        w.inactive.fg_stroke = Stroke::new(1.0, self.fg);
+        w.inactive.bg_stroke = Stroke::new(1.0_f32, self.border);
+        w.inactive.fg_stroke = Stroke::new(1.0_f32, self.fg);
         w.inactive.corner_radius = r;
 
         w.hovered.bg_fill = self.raised_hover;
         w.hovered.weak_bg_fill = self.raised_hover;
-        w.hovered.bg_stroke = Stroke::new(1.0, self.accent);
-        w.hovered.fg_stroke = Stroke::new(1.5, self.fg_strong);
+        w.hovered.bg_stroke = Stroke::new(1.0_f32, self.accent);
+        w.hovered.fg_stroke = Stroke::new(1.5_f32, self.fg_strong);
         w.hovered.corner_radius = r;
         w.hovered.expansion = 0.0;
 
         w.active.bg_fill = self.accent_bg;
         w.active.weak_bg_fill = self.accent_bg;
-        w.active.bg_stroke = Stroke::new(1.0, self.accent);
-        w.active.fg_stroke = Stroke::new(1.5, self.accent_hi);
+        w.active.bg_stroke = Stroke::new(1.0_f32, self.accent);
+        w.active.fg_stroke = Stroke::new(1.5_f32, self.accent_hi);
         w.active.corner_radius = r;
         w.active.expansion = 0.0;
 
         w.open.bg_fill = self.accent_bg;
         w.open.weak_bg_fill = self.accent_bg;
-        w.open.bg_stroke = Stroke::new(1.0, self.accent);
-        w.open.fg_stroke = Stroke::new(1.0, self.fg_strong);
+        w.open.bg_stroke = Stroke::new(1.0_f32, self.accent);
+        w.open.fg_stroke = Stroke::new(1.0_f32, self.fg_strong);
         w.open.corner_radius = r;
         v
     }

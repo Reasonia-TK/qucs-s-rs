@@ -63,8 +63,39 @@ fn cmd(p: &Path) -> Command {
     c
 }
 
-/// Netlist a saved schematic with qucs-s.
+/// Which netlister `netlist` uses: `QUCS_RS_NETLISTER` = `auto` (default: built-in,
+/// qucs-s for what it cannot translate), `builtin` or `qucs-s`.
+fn netlister_pref() -> String {
+    std::env::var("QUCS_RS_NETLISTER").unwrap_or_default().to_ascii_lowercase()
+}
+
+/// Netlist a saved schematic: the built-in netlister, or qucs-s for parts it does not know.
 pub fn netlist(sch_path: &Path, out: &Path) -> Result<String, String> {
+    let pref = netlister_pref();
+    if pref != "qucs-s" && pref != "qucs" {
+        match crate::spice::build_file(sch_path, crate::spice::Mode::Simulations) {
+            Ok((n, _)) => {
+                if let Some(d) = out.parent() {
+                    let _ = std::fs::create_dir_all(d);
+                }
+                std::fs::write(out, &n.text).map_err(|e| format!("{}: {e}", out.display()))?;
+                return Ok(n.text);
+            }
+            Err(missing) => {
+                if pref == "builtin" || qucs_s_path().is_err() {
+                    return Err(format!(
+                        "the built-in netlister cannot translate: {}\nInstall Qucs-S (it is then used automatically) or replace these parts.",
+                        missing.join(", ")
+                    ));
+                }
+            }
+        }
+    }
+    netlist_qucs_s(sch_path, out)
+}
+
+/// Netlist a saved schematic with qucs-s.
+pub fn netlist_qucs_s(sch_path: &Path, out: &Path) -> Result<String, String> {
     let _ = std::fs::remove_file(out);
     let q = qucs_s_path()?;
     let o = cmd(&q)
@@ -485,10 +516,76 @@ impl SimResult {
     }
 }
 
+/// Absolute path without the `\\?\` prefix Windows' `canonicalize` adds.
+pub fn canonical(p: &Path) -> Result<PathBuf, String> {
+    let c = p.canonicalize().map_err(|e| format!("{}: {e}", p.display()))?;
+    let s = c.display().to_string();
+    Ok(match s.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC") => PathBuf::from(rest),
+        _ => c,
+    })
+}
+
+/// `<dir>/<stem>_<suffix>` next to a schematic, plus the stem.
+pub fn work_dir(sch_path: &Path, suffix: &str) -> Result<(PathBuf, String), String> {
+    let stem = sch_path.file_stem().map(|s| s.to_string_lossy().to_string()).ok_or_else(|| format!("{}: not a file name", sch_path.display()))?;
+    let dir = sch_path.parent().ok_or_else(|| format!("{}: no parent directory", sch_path.display()))?;
+    Ok((dir.join(format!("{stem}_{suffix}")), stem))
+}
+
+/// DC operating point of a saved schematic (built-in netlister only, so that the
+/// SPICE node names can be mapped back to the nets of the schematic).
+pub struct OperatingPoint {
+    /// voltage of every net (index = net index of the schematic's connectivity)
+    pub net_volts: Vec<Option<f64>>,
+    /// net names, same order
+    pub net_names: Vec<String>,
+    /// branch currents of voltage sources / probes: (element, A)
+    pub currents: Vec<(String, f64)>,
+    pub errors: Vec<String>,
+}
+
+impl OperatingPoint {
+    pub fn json(&self) -> Value {
+        let nodes: serde_json::Map<String, Value> = self
+            .net_names
+            .iter()
+            .zip(&self.net_volts)
+            .filter(|(n, _)| !n.eq_ignore_ascii_case("gnd"))
+            .map(|(n, v)| (n.clone(), v.map(g6).unwrap_or(Value::Null)))
+            .collect();
+        let cur: serde_json::Map<String, Value> = self.currents.iter().map(|(n, v)| (n.clone(), g6(*v))).collect();
+        json!({"node_voltages_V": nodes, "branch_currents_A": cur, "errors": self.errors})
+    }
+}
+
+pub fn operating_point(sch_path: &Path, timeout_s: u64) -> Result<OperatingPoint, String> {
+    let sch_path = canonical(sch_path)?;
+    let (n, conn) = crate::spice::build_file(&sch_path, crate::spice::Mode::OperatingPoint)
+        .map_err(|m| format!("DC operating point needs the built-in netlister, which cannot translate: {}", m.join(", ")))?;
+    let (workdir, stem) = work_dir(&sch_path, "op")?;
+    std::fs::create_dir_all(&workdir).map_err(|e| e.to_string())?;
+    let net_path = workdir.join(format!("{stem}_op.cir"));
+    std::fs::write(&net_path, &n.text).map_err(|e| e.to_string())?;
+    let r = run_netlist(&n.text, &workdir, &net_path, timeout_s)?;
+    let plot = r.plots.iter().find(|p| p.kind == "op").ok_or_else(|| format!("ngspice gave no operating point:\n{}", r.errors.join("\n")))?;
+    let value = |name: &str| plot.vectors.iter().find(|v| v.name.eq_ignore_ascii_case(name) || v.name.eq_ignore_ascii_case(&format!("v({name})"))).and_then(|v| v.re.first().copied());
+    let net_volts = n.node_names.iter().map(|nm| if nm == "0" { Some(0.0) } else { value(nm) }).collect();
+    let currents = plot
+        .vectors
+        .iter()
+        .filter_map(|v| {
+            let l = v.name.to_ascii_lowercase();
+            let el = l.strip_suffix("#branch").or_else(|| l.strip_prefix("i(").and_then(|x| x.strip_suffix(')')))?;
+            Some((el.to_string(), *v.re.first()?))
+        })
+        .collect();
+    Ok(OperatingPoint { net_volts, net_names: conn.nets.iter().map(|n| n.name.clone()).collect(), currents, errors: r.errors })
+}
+
 pub fn simulate(sch_path: &Path, timeout_s: u64) -> Result<SimResult, String> {
-    let sch_path = sch_path.canonicalize().map_err(|e| format!("{}: {e}", sch_path.display()))?;
-    let stem = sch_path.file_stem().unwrap().to_string_lossy().to_string();
-    let workdir = sch_path.parent().unwrap().join(format!("{stem}_sim"));
+    let sch_path = canonical(sch_path)?;
+    let (workdir, stem) = work_dir(&sch_path, "sim")?;
     std::fs::create_dir_all(&workdir).map_err(|e| e.to_string())?;
     let net_path = workdir.join(format!("{stem}.cir"));
     let net = netlist(&sch_path, &net_path)?;
@@ -510,15 +607,17 @@ pub fn run_netlist(net: &str, workdir: &Path, net_path: &Path, timeout_s: u64) -
     let t0 = Instant::now();
     let mut child = cmd(&ng)
         .arg("-b")
-        .arg(net_path.file_name().unwrap())
+        .arg(net_path.file_name().ok_or("netlist path has no file name")?)
         .current_dir(&workdir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("cannot run ngspice: {e}"))?;
     // read output in threads to avoid pipe dead-locks
-    let mut so = child.stdout.take().unwrap();
-    let mut se = child.stderr.take().unwrap();
+    let (Some(mut so), Some(mut se)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = child.kill();
+        return Err("cannot capture ngspice output".into());
+    };
     let h1 = std::thread::spawn(move || {
         let mut s = String::new();
         let mut b = Vec::new();
