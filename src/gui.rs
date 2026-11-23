@@ -305,16 +305,78 @@ struct Tools {
     tune_open: bool,
     tunes: Vec<Tune>,
     tune_auto: bool,
+    tune_pick: usize,
     result: String,
 }
 
 struct Tune {
     comp: String,
     prop: usize,
+    /// `Some(name)` for a `name=value` parameter (SpicePar / Eqn).
+    key: Option<String>,
+    label: String,
     unit: String,
     value: f64,
     min: f64,
     max: f64,
+}
+
+impl Tune {
+    fn same_target(&self, o: &Tune) -> bool {
+        self.comp == o.comp && self.prop == o.prop && self.key == o.key
+    }
+
+    /// The current value as it is written (without the `name=` part).
+    fn value_text(&self) -> String {
+        if self.key.is_none() {
+            return crate::rftools::format_value(self.value, &self.unit);
+        }
+        // SPICE reads "M" as milli and does not allow "1 k"
+        let v = crate::rftools::format_value(self.value, "").replace(' ', "");
+        match v.strip_suffix('M') {
+            Some(m) => format!("{m}Meg"),
+            None => v,
+        }
+    }
+
+    /// Property text for the current value.
+    fn text(&self) -> String {
+        match &self.key {
+            Some(k) => format!("{k}={}", self.value_text()),
+            None => self.value_text(),
+        }
+    }
+}
+
+/// Unit name following the number and SI prefix (`"10 pF"` -> `"F"`).
+fn value_unit(s: &str) -> String {
+    let rest = s.trim_start_matches(|ch: char| ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == '+' || ch == 'e' || ch == 'E').trim();
+    let rest = ["Meg", "meg", "MEG"].iter().find_map(|p| rest.strip_prefix(p)).unwrap_or_else(|| rest.trim_start_matches(['f', 'p', 'n', 'u', 'µ', 'm', 'k', 'M', 'G', 'T']));
+    rest.trim().to_string()
+}
+
+/// Every numeric value of `c` that the tuning window can drive.
+fn tune_targets(c: &crate::schematic::Component) -> Vec<Tune> {
+    let keyed = c.typ == "SpicePar" || c.typ == "Eqn";
+    let mut out = Vec::new();
+    for (i, p) in c.props.iter().enumerate() {
+        let (key, text) = match p.value.split_once('=') {
+            Some((k, v)) if keyed && !k.trim().is_empty() => (Some(k.trim().to_string()), v.trim()),
+            _ => (None, p.value.trim()),
+        };
+        let Some(v) = crate::rftools::parse_value(text) else { continue };
+        if v == 0.0 || !v.is_finite() {
+            continue; // no sensible ×1/10..×10 range
+        }
+        let label = match &key {
+            Some(k) => format!("{}: {k}", c.name),
+            None => format!("{}.{}", c.name, crate::library::prop_name(c, i)),
+        };
+        let unit = if key.is_some() { String::new() } else { value_unit(text) };
+        let (min, max) = if v > 0.0 { (v / 10.0, v * 10.0) } else { (v * 10.0, v / 10.0) };
+        out.push(Tune { comp: c.name.clone(), prop: i, key, label, unit, value: v, min, max });
+    }
+    out
 }
 
 impl Default for Tools {
@@ -356,6 +418,7 @@ impl Default for Tools {
             tune_open: false,
             tunes: vec![],
             tune_auto: true,
+            tune_pick: 0,
             result: String::new(),
         }
     }
@@ -2778,26 +2841,49 @@ impl App {
         let mut apply: Option<usize> = None;
         let mut remove: Option<usize> = None;
         egui::Window::new("チューニング").open(&mut open).default_width(380.0).show(ctx, |ui| {
-            ui.small("部品を選んで「追加」→ スライダーを動かすと値を書き換えて再シミュレーションします");
-            if ui.add_enabled(self.sel.len() == 1, egui::Button::new("選択中の部品の主な値を追加")).clicked() {
-                let ci = self.sel[0];
-                let c = &self.doc.sch.components[ci];
-                if let Some(v) = c.props.first().and_then(|p| crate::rftools::parse_value(&p.value)) {
-                    let unit: String = c.props[0].value.trim_start_matches(|ch: char| ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == '+' || ch == 'e' || ch == 'E').trim().trim_start_matches(['f', 'p', 'n', 'u', 'µ', 'm', 'k', 'M', 'G', 'T']).trim().to_string();
-                    self.tools.tunes.push(Tune { comp: c.name.clone(), prop: 0, unit, value: v, min: v / 10.0, max: v * 10.0 });
-                } else {
-                    self.status = "数値の値を持つ部品を選んでください".into();
+            ui.small("部品またはパラメータ（SpicePar / Eqn）を選んで「追加」→ スライダーを動かすと値を書き換えて再シミュレーションします");
+            // the selected component's values first, then every parameter of the schematic
+            let mut cands: Vec<Tune> = Vec::new();
+            if self.sel.len() == 1 {
+                if let Some(c) = self.doc.sch.components.get(self.sel[0]) {
+                    cands.extend(tune_targets(c));
                 }
+            }
+            for c in self.doc.sch.components.iter().filter(|c| c.typ == "SpicePar" || c.typ == "Eqn") {
+                for t in tune_targets(c) {
+                    if !cands.iter().any(|o| o.same_target(&t)) {
+                        cands.push(t);
+                    }
+                }
+            }
+            cands.retain(|t| !self.tools.tunes.iter().any(|o| o.same_target(t)));
+            if self.tools.tune_pick >= cands.len() {
+                self.tools.tune_pick = 0;
+            }
+            ui.horizontal(|ui| {
+                let shown = cands.get(self.tools.tune_pick).map(|t| format!("{} = {}", t.label, t.value_text())).unwrap_or_else(|| "（候補なし）".into());
+                egui::ComboBox::from_id_salt("tune_pick").width(260.0).selected_text(shown).show_ui(ui, |ui| {
+                    for (i, t) in cands.iter().enumerate() {
+                        ui.selectable_value(&mut self.tools.tune_pick, i, format!("{} = {}", t.label, t.value_text()));
+                    }
+                });
+                if ui.add_enabled(!cands.is_empty(), egui::Button::new("追加")).clicked() {
+                    self.tools.tunes.push(cands.swap_remove(self.tools.tune_pick));
+                    self.tools.tune_pick = 0;
+                }
+            });
+            if cands.is_empty() && self.tools.tunes.is_empty() {
+                ui.small("数値の値を持つ部品を1つ選ぶか、SpicePar（例: Uin=1.5）を配置してください");
             }
             ui.checkbox(&mut self.tools.tune_auto, "値を変えたら自動でシミュレーション");
             for (k, t) in self.tools.tunes.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
-                    ui.label(format!("{} = {}", t.comp, crate::rftools::format_value(t.value, &t.unit)));
+                    ui.label(format!("{} = {}", t.label, t.value_text()));
                     if ui.small_button("✖").clicked() {
                         remove = Some(k);
                     }
                 });
-                let r = ui.add(egui::Slider::new(&mut t.value, t.min..=t.max).logarithmic(true).show_value(false));
+                let r = ui.add(egui::Slider::new(&mut t.value, t.min..=t.max).logarithmic(t.min > 0.0).show_value(false));
                 if r.drag_stopped() || (r.changed() && !r.dragged()) {
                     apply = Some(k);
                 }
@@ -2807,9 +2893,18 @@ impl App {
             self.tools.tunes.remove(k);
         }
         if let Some(k) = apply {
-            let (comp, prop) = (self.tools.tunes[k].comp.clone(), self.tools.tunes[k].prop);
-            let v = crate::rftools::format_value(self.tools.tunes[k].value, &self.tools.tunes[k].unit);
-            if let Some(ci) = self.doc.sch.component_index(&comp) {
+            let t = &self.tools.tunes[k];
+            let (comp, v) = (t.comp.clone(), t.text());
+            // a parameter is found again by its name, in case lines were added or removed
+            let target = self.doc.sch.component_index(&comp).and_then(|ci| {
+                let props = &self.doc.sch.components[ci].props;
+                let pi = match &t.key {
+                    Some(key) => props.iter().position(|p| p.value.split_once('=').is_some_and(|(n, _)| n.trim() == key)),
+                    None => (t.prop < props.len()).then_some(t.prop),
+                };
+                pi.map(|pi| (ci, pi))
+            });
+            if let Some((ci, prop)) = target {
                 self.doc.checkpoint();
                 self.doc.sch.components[ci].props[prop].value = v.clone();
                 self.changed();
@@ -2817,6 +2912,8 @@ impl App {
                 if self.tools.tune_auto && self.sim_rx.is_none() {
                     self.run_sim();
                 }
+            } else {
+                self.status = format!("{comp} が見つかりません（削除または名前変更された可能性があります）");
             }
         }
         self.tools.tune_open = open;
@@ -3665,4 +3762,38 @@ impl Drop for App {
 fn wire_cover(wires: &[crate::schematic::Wire], moved: &[crate::schematic::Wire]) -> Vec<usize> {
     let inside = |w: &crate::schematic::Wire, p: (i32, i32)| (w.x1.min(w.x2)..=w.x1.max(w.x2)).contains(&p.0) && (w.y1.min(w.y2)..=w.y1.max(w.y2)).contains(&p.1);
     wires.iter().enumerate().filter(|(_, w)| moved.iter().any(|m| inside(m, w.p1()) && inside(m, w.p2()) || inside(w, m.p1()) && inside(w, m.p2()))).map(|(i, _)| i).collect()
+}
+
+#[cfg(test)]
+mod tune_tests {
+    use super::*;
+
+    #[test]
+    fn spice_parameters_are_tunable() {
+        let mut c = crate::library::new_component("SpicePar", "SpicePar1", 0, 0).unwrap();
+        c.props = vec![
+            crate::schematic::Prop { value: "Uin=1.5".into(), display: "1".into() },
+            crate::schematic::Prop { value: "Rl=2k".into(), display: "1".into() },
+        ];
+        let t = tune_targets(&c);
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0].key.as_deref(), Some("Uin"));
+        assert_eq!(t[1].label, "SpicePar1: Rl");
+        assert_eq!(t[1].text(), "Rl=2k");
+        let mut big = Tune { value: 4.7e6, ..tune_targets(&c).remove(1) };
+        assert_eq!(big.text(), "Rl=4.7Meg");
+        big.value = 3.3e-3;
+        assert_eq!(big.text(), "Rl=3.3m");
+    }
+
+    #[test]
+    fn every_numeric_property_is_offered() {
+        let c = crate::library::new_component("R", "R1", 0, 0).unwrap();
+        let t = tune_targets(&c);
+        assert!(!t.is_empty());
+        assert!(t.iter().all(|t| t.key.is_none()));
+        assert!(t[0].label.starts_with("R1."), "{}", t[0].label);
+        assert_eq!(value_unit("10 pF"), "F");
+        assert_eq!(value_unit("1 MegOhm"), "Ohm");
+    }
 }
