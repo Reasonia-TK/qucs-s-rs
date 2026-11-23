@@ -12,6 +12,7 @@ mod library;
 mod mcp;
 mod montecarlo;
 mod netlist;
+mod palette;
 mod pdf;
 mod plot;
 mod qlib;

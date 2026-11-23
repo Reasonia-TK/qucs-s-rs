@@ -12,11 +12,38 @@ pub struct Issue {
     pub severity: &'static str, // error | warning | info
     pub message: String,
     pub at: (f64, f64),
+    pub summary_ja: String,
 }
 
 impl Issue {
     pub fn json(&self, n: usize) -> Value {
         json!({"id": n, "kind": self.kind, "severity": self.severity, "message": self.message, "at": [self.at.0.round(), self.at.1.round()]})
+    }
+
+    pub fn guidance_ja(&self) -> &'static str {
+        match self.kind {
+            "pin_on_wire_middle" | "wire_end_on_wire_middle" => "接続する場合は交点に接続点を作ります。別のネットなら、配線を引き直して間隔を空けます。",
+            "unconnected_pin" => "接続先がある場合は「配線」または「自動配線」で接続します。",
+            "diagonal_wire" => "配線を水平・垂直の区間に引き直します。",
+            "off_grid" => "部品または配線端をグリッド上に移動します。",
+            "dangling_wire" => "配線端をピンまたは接続点につなぎます。不要な配線は削除します。",
+            "overlapping_wires" if self.severity == "error" => "別のネットです。どちらかを引き直して重なりを解消します。",
+            "overlapping_wires" => "同じネットです。接続を確認し、重複する区間を整理します。",
+            "component_overlap" => "どちらかの部品をドラッグして間隔を空けます。",
+            "wire_through_symbol" => "部品の外側を通るように配線を引き直します。",
+            "text_overlap" => "ラベルをドラッグして、部品や配線から離します。",
+            _ => "",
+        }
+    }
+
+    pub fn junction_point(&self, sch: &Schematic) -> Option<(i32, i32)> {
+        if !matches!(self.kind, "pin_on_wire_middle" | "wire_end_on_wire_middle") {
+            return None;
+        }
+        let point = (self.at.0 as i32, self.at.1 as i32);
+        // Several through wires can be unrelated nets at a crossing. Leave that choice to the user.
+        let through = sch.wires.iter().filter(|w| !w.is_point() && w.contains(point.0, point.1, false));
+        (through.take(2).count() == 1).then_some(point)
     }
 }
 
@@ -61,9 +88,10 @@ pub fn check(sch: &Schematic, conn: &Connectivity) -> Report {
                 severity: "error",
                 message: format!("{} touches the middle of a wire but is NOT connected (Qucs connects only at wire ends). Use connect or split the wire.", p.label),
                 at: (p.x as f64, p.y as f64),
+                summary_ja: format!("ピン {} が配線の途中に重なっていますが、未接続です", p.label),
             });
         } else if d <= 1 {
-            issues.push(Issue { kind: "unconnected_pin", severity: "warning", message: format!("{} is not connected", p.label), at: (p.x as f64, p.y as f64) });
+            issues.push(Issue { kind: "unconnected_pin", severity: "warning", message: format!("{} is not connected", p.label), at: (p.x as f64, p.y as f64), summary_ja: format!("ピン {} が未接続です", p.label) });
         }
     }
 
@@ -71,11 +99,12 @@ pub fn check(sch: &Schematic, conn: &Connectivity) -> Report {
     let pin_pts: std::collections::HashSet<(i32, i32)> = conn.pins.iter().map(|p| (p.x, p.y)).collect();
     for (i, w) in sch.wires.iter().enumerate() {
         if w.x1 != w.x2 && w.y1 != w.y2 {
-            issues.push(Issue { kind: "diagonal_wire", severity: "warning", message: format!("wire {i} is diagonal"), at: (w.x1 as f64, w.y1 as f64) });
+            issues.push(Issue { kind: "diagonal_wire", severity: "warning", message: format!("wire {i} is diagonal"), at: (w.x1 as f64, w.y1 as f64), summary_ja: format!("配線（{}, {}）が斜めに引かれています", w.x1, w.y1) });
         }
         for c in [w.x1, w.y1, w.x2, w.y2] {
             if c % 10 != 0 {
-                issues.push(Issue { kind: "off_grid", severity: "warning", message: format!("wire {i} is off the 10-unit grid"), at: (w.x1 as f64, w.y1 as f64) });
+                let p = if w.x1 % 10 != 0 || w.y1 % 10 != 0 { w.p1() } else { w.p2() };
+                issues.push(Issue { kind: "off_grid", severity: "warning", message: format!("wire {i} is off the 10-unit grid"), at: (p.0 as f64, p.1 as f64), summary_ja: format!("配線端（{}, {}）がグリッドから外れています", p.0, p.1) });
                 break;
             }
         }
@@ -88,9 +117,10 @@ pub fn check(sch: &Schematic, conn: &Connectivity) -> Report {
                     severity: "error",
                     message: format!("wire end ({},{}) lies on the middle of another wire but is NOT connected", p.0, p.1),
                     at: (p.0 as f64, p.1 as f64),
+                    summary_ja: format!("配線端（{}, {}）が別の配線に重なっていますが、未接続です", p.0, p.1),
                 });
             } else if d == 1 && !pin_pts.contains(&p) && w.label.is_empty() && !w.is_point() {
-                issues.push(Issue { kind: "dangling_wire", severity: "warning", message: format!("open wire end at ({},{})", p.0, p.1), at: (p.0 as f64, p.1 as f64) });
+                issues.push(Issue { kind: "dangling_wire", severity: "warning", message: format!("open wire end at ({},{})", p.0, p.1), at: (p.0 as f64, p.1 as f64), summary_ja: format!("配線端（{}, {}）が未接続です", p.0, p.1) });
             }
         }
     }
@@ -111,11 +141,22 @@ pub fn check(sch: &Schematic, conn: &Connectivity) -> Report {
             };
             if ov {
                 let same = conn.wire_net[i] == conn.wire_net[j];
+                let midpoint = |a1: i32, a2: i32, b1: i32, b2: i32| {
+                    let start = a1.min(a2).max(b1.min(b2));
+                    let end = a1.max(a2).min(b1.max(b2));
+                    (f64::from(start) + f64::from(end)) / 2.0
+                };
+                let at = if a.is_horizontal() {
+                    (midpoint(a.x1, a.x2, b.x1, b.x2), f64::from(a.y1))
+                } else {
+                    (f64::from(a.x1), midpoint(a.y1, a.y2, b.y1, b.y2))
+                };
                 issues.push(Issue {
                     kind: "overlapping_wires",
                     severity: if same { "warning" } else { "error" },
                     message: format!("wires {i} and {j} overlap{}", if same { " (same net, redundant)" } else { " (different nets – looks shorted)" }),
-                    at: (a.x1 as f64, a.y1 as f64),
+                    at,
+                    summary_ja: format!("（{}, {}）付近で配線が重なっています", at.0, at.1),
                 });
             }
         }
@@ -125,7 +166,7 @@ pub fn check(sch: &Schematic, conn: &Connectivity) -> Report {
     for (i, pi) in conn.placed.iter().enumerate() {
         let c = &sch.components[i];
         if c.x % 10 != 0 || c.y % 10 != 0 {
-            issues.push(Issue { kind: "off_grid", severity: "warning", message: format!("{} is off the grid", c.name), at: (c.x as f64, c.y as f64) });
+            issues.push(Issue { kind: "off_grid", severity: "warning", message: format!("{} is off the grid", c.name), at: (c.x as f64, c.y as f64), summary_ja: format!("部品 {} がグリッドから外れています", c.name) });
         }
         let shrink = |b: [f64; 4]| [b[0] + 3.0, b[1] + 3.0, b[2] - 3.0, b[3] - 3.0];
         for j in i + 1..conn.placed.len() {
@@ -136,6 +177,7 @@ pub fn check(sch: &Schematic, conn: &Connectivity) -> Report {
                     severity: "error",
                     message: format!("{} and {} overlap", names[i], names[j]),
                     at: ((pi.bbox[0] + pi.bbox[2]) / 2.0, (pi.bbox[1] + pi.bbox[3]) / 2.0),
+                    summary_ja: format!("部品 {} と {} が重なっています", names[i], names[j]),
                 });
             }
         }
@@ -150,25 +192,26 @@ pub fn check(sch: &Schematic, conn: &Connectivity) -> Report {
                     severity: "error",
                     message: format!("wire {wi} runs through the symbol of {}", names[i]),
                     at: ((pi.bbox[0] + pi.bbox[2]) / 2.0, (pi.bbox[1] + pi.bbox[3]) / 2.0),
+                    summary_ja: format!("配線が部品 {} のシンボル内を通っています", names[i]),
                 });
             }
         }
     }
 
     // labels overlapping things
-    let mut label_boxes: Vec<(String, [f64; 4])> = Vec::new();
+    let mut label_boxes: Vec<(String, String, [f64; 4])> = Vec::new();
     for (i, p) in conn.placed.iter().enumerate() {
         if let Some(b) = p.label_bbox {
-            label_boxes.push((format!("label of {}", names[i]), b));
+            label_boxes.push((format!("label of {}", names[i]), format!("部品 {} のラベル", names[i]), b));
         }
     }
     for w in &sch.wires {
         if !w.label.is_empty() {
             let b = [w.lx as f64, w.ly as f64, w.lx as f64 + text_width(&w.label, FONT_PX), w.ly as f64 + LINE_H];
-            label_boxes.push((format!("net label '{}'", w.label), b));
+            label_boxes.push((format!("net label '{}'", w.label), format!("ネットラベル「{}」", w.label), b));
         }
     }
-    for (k, (desc, b)) in label_boxes.iter().enumerate() {
+    for (k, (desc, label_ja, b)) in label_boxes.iter().enumerate() {
         let mut hits = Vec::new();
         for (i, p) in conn.placed.iter().enumerate() {
             let own = desc == &format!("label of {}", names[i]);
@@ -176,7 +219,7 @@ pub fn check(sch: &Schematic, conn: &Connectivity) -> Report {
                 hits.push(format!("symbol {}", names[i]));
             }
         }
-        for (j, (d2, b2)) in label_boxes.iter().enumerate() {
+        for (j, (d2, _, b2)) in label_boxes.iter().enumerate() {
             if j > k && inter(b, b2) > 4.0 {
                 hits.push(d2.clone());
             }
@@ -186,7 +229,7 @@ pub fn check(sch: &Schematic, conn: &Connectivity) -> Report {
             hits.push(format!("{wires_hit} wire(s)"));
         }
         if !hits.is_empty() {
-            issues.push(Issue { kind: "text_overlap", severity: "warning", message: format!("{desc} overlaps {}", hits.join(", ")), at: ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0) });
+            issues.push(Issue { kind: "text_overlap", severity: "warning", message: format!("{desc} overlaps {}", hits.join(", ")), at: ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0), summary_ja: format!("{label_ja}が部品、配線、または別のラベルに重なっています") });
         }
     }
 
@@ -239,4 +282,30 @@ pub fn check(sch: &Schematic, conn: &Connectivity) -> Report {
         "warnings": warnings,
     });
     Report { issues, metrics }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schematic::Wire;
+
+    #[test]
+    fn junction_action_only_targets_one_through_wire() {
+        let mut sch = Schematic::new_empty("junction");
+        sch.wires = vec![Wire::new(-40, 0, 40, 0), Wire::new(0, -20, 0, 0)];
+        let find_junction = |sch: &Schematic| {
+            check(sch, &Connectivity::build(sch, None)).issues.into_iter()
+                .find(|issue| issue.kind == "wire_end_on_wire_middle").unwrap()
+        };
+        let issue = find_junction(&sch);
+        assert_eq!(issue.junction_point(&sch), Some((0, 0)));
+
+        sch.wires.push(Wire::new(0, -40, 0, 40));
+        assert_eq!(issue.junction_point(&sch), None);
+        sch.wires.pop();
+
+        sch.wires = crate::doc::split_wires_at(std::mem::take(&mut sch.wires), (0, 0));
+        let report = check(&sch, &Connectivity::build(&sch, None));
+        assert!(!report.issues.iter().any(|issue| issue.kind == "wire_end_on_wire_middle"));
+    }
 }

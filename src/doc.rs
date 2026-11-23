@@ -3,17 +3,28 @@
 use crate::library::{self, lib, text_width, FONT_PX, LINE_H};
 use crate::netlist::Connectivity;
 use crate::router::{path_stats, path_wires, Arrive, Costs, Grid, Target, G};
-use crate::schematic::{Component, Prop, Schematic, Wire};
+use crate::schematic::{read_file, Component, Prop, Schematic, Wire};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 pub struct Doc {
     pub sch: Schematic,
     pub path: Option<PathBuf>,
+    disk_bytes: Option<Vec<u8>>,
     undo: Vec<Schematic>,
     redo: Vec<Schematic>,
     pub dirty: bool,
+}
+
+pub enum ExternalChange {
+    Missing,
+    Modified(Vec<u8>),
+}
+
+pub fn same_path(a: &Path, b: &Path) -> bool {
+    a == b || a.canonicalize().ok().zip(b.canonicalize().ok()).is_some_and(|(a, b)| a == b)
 }
 
 #[derive(Clone, Debug)]
@@ -27,14 +38,43 @@ pub struct Terminal {
 
 impl Doc {
     pub fn new(sch: Schematic, path: Option<PathBuf>) -> Doc {
-        let mut d = Doc { sch, path, undo: Vec::new(), redo: Vec::new(), dirty: false };
+        let bytes = path.as_deref().and_then(|p| read_file(p).ok().flatten());
+        Doc::from_schematic(sch, path, bytes)
+    }
+
+    pub fn for_new_file(sch: Schematic, path: PathBuf) -> Doc {
+        Doc::from_schematic(sch, Some(path), None)
+    }
+
+    fn from_schematic(sch: Schematic, path: Option<PathBuf>, disk_bytes: Option<Vec<u8>>) -> Doc {
+        let mut d = Doc { sch, path, disk_bytes, undo: Vec::new(), redo: Vec::new(), dirty: false };
         d.fix_names();
         d
     }
 
     pub fn open(path: &Path) -> Result<Doc, String> {
-        let sch = Schematic::load(path)?;
-        Ok(Doc::new(sch, Some(path.to_path_buf())))
+        let bytes = read_file(path)?.ok_or_else(|| format!("cannot read {}: file does not exist", path.display()))?;
+        Self::from_disk(path, bytes)
+    }
+
+    pub fn from_disk(path: &Path, bytes: Vec<u8>) -> Result<Doc, String> {
+        let sch = Schematic::parse(&String::from_utf8_lossy(&bytes))?;
+        Ok(Doc::from_schematic(sch, Some(path.to_path_buf()), Some(bytes)))
+    }
+
+    pub fn external_change(&self) -> Result<Option<ExternalChange>, String> {
+        let Some(path) = &self.path else { return Ok(None) };
+        let current = read_file(path)?;
+        Ok(if current == self.disk_bytes {
+            None
+        } else {
+            Some(current.map_or(ExternalChange::Missing, ExternalChange::Modified))
+        })
+    }
+
+    pub fn last_saved(&self) -> Option<Doc> {
+        let bytes = self.disk_bytes.clone()?;
+        Self::from_disk(self.path.as_deref()?, bytes).ok()
     }
 
     pub fn dir(&self) -> Option<PathBuf> {
@@ -74,9 +114,43 @@ impl Doc {
 
     pub fn save(&mut self) -> Result<PathBuf, String> {
         let p = self.path.clone().ok_or("schematic has no file name yet")?;
-        self.sch.save(&p)?;
+        self.disk_bytes = Some(self.sch.save_if_current(&p, self.disk_bytes.as_deref())?);
         self.dirty = false;
         Ok(p)
+    }
+
+    pub fn save_as(&mut self, path: PathBuf) -> Result<(), String> {
+        if self.path.as_ref().is_some_and(|old| same_path(old, &path)) {
+            return self.save().map(|_| ());
+        }
+        let expected = read_file(&path)?;
+        self.disk_bytes = Some(self.sch.save_if_current(&path, expected.as_deref())?);
+        self.path = Some(path);
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Keep the draft beside the original so relative model paths still resolve.
+    pub fn save_conflict_draft(&self) -> Result<PathBuf, String> {
+        let path = self.path.as_ref().ok_or("schematic has no file name yet")?;
+        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+        let contents = self.sch.serialize();
+        for n in 1..=u32::MAX {
+            let name = if n == 1 { format!("{stem}.local-draft.sch") } else { format!("{stem}.local-draft-{n}.sch") };
+            let draft = path.with_file_name(name);
+            let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&draft) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("{}: {e}", draft.display())),
+            };
+            if let Err(e) = file.write_all(contents.as_bytes()).and_then(|()| file.sync_all()) {
+                drop(file);
+                let _ = std::fs::remove_file(&draft);
+                return Err(format!("{}: {e}", draft.display()));
+            }
+            return Ok(draft);
+        }
+        Err("no unused draft name".into())
     }
 
     /// Qucs stores every ground as "*"; give each component a unique name so it can be addressed.
@@ -1193,4 +1267,78 @@ pub fn normalize_wires(mut wires: Vec<Wire>, pins: &HashSet<(i32, i32)>) -> Vec<
         }
     }
     wires
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::*;
+
+    fn new_test_doc(name: &str) -> (PathBuf, Doc) {
+        let folder = std::env::temp_dir().join(format!("qucs-rs-{name}-{}", std::process::id()));
+        let path = folder.join("test.sch");
+        let mut doc = Doc::for_new_file(Schematic::new_empty("test"), path.clone());
+        doc.save().unwrap();
+        (path, doc)
+    }
+
+    fn edit(doc: &mut Doc, value: &str) {
+        doc.checkpoint();
+        doc.sch.properties.push(format!("  <FrameText0={value}>"));
+    }
+
+    #[test]
+    fn conflict_keeps_disk_and_local_draft_separate() {
+        let (path, mut local) = new_test_doc("draft");
+        let mut external = Doc::open(&path).unwrap();
+        edit(&mut local, "local");
+        edit(&mut external, "external");
+        external.save().unwrap();
+
+        assert!(local.save().is_err());
+        assert!(local.save_as(path.canonicalize().unwrap()).is_err());
+        assert!(local.dirty);
+        let Some(ExternalChange::Modified(bytes)) = local.external_change().unwrap() else { panic!("expected external version") };
+        let preview = Doc::from_disk(&path, bytes).unwrap();
+        assert_eq!(preview.sch.properties, external.sch.properties);
+
+        let draft = local.save_conflict_draft().unwrap();
+        let draft_again = local.save_conflict_draft().unwrap();
+        assert_ne!(draft, draft_again);
+        assert_eq!(Doc::open(&draft).unwrap().sch.properties, local.sch.properties);
+        assert_eq!(Doc::open(&path).unwrap().sch.properties, external.sch.properties);
+
+        let copy = path.with_file_name("copy.sch");
+        local.save_as(copy.clone()).unwrap();
+        assert!(!local.dirty);
+        assert!(local.external_change().unwrap().is_none());
+        std::fs::remove_file(copy).unwrap();
+        std::fs::remove_file(draft).unwrap();
+        std::fs::remove_file(draft_again).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn two_writers_with_the_same_baseline_cannot_both_save() {
+        let (path, mut first) = new_test_doc("parallel-writes");
+        let mut second = Doc::open(&path).unwrap();
+        edit(&mut first, "first");
+        edit(&mut second, "second");
+        let start = std::sync::Barrier::new(2);
+        let outcomes = std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                start.wait();
+                first.save()
+            });
+            start.wait();
+            let other = second.save();
+            (writer.join().unwrap(), other)
+        });
+        assert_ne!(outcomes.0.is_ok(), outcomes.1.is_ok());
+        let winner = if outcomes.0.is_ok() { first } else { second };
+        assert_eq!(Doc::open(&path).unwrap().sch.properties, winner.sch.properties);
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
 }

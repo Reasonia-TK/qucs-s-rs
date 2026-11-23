@@ -1,7 +1,7 @@
 //! MCP server over stdio (JSON-RPC 2.0, newline delimited).
 
 use crate::check;
-use crate::doc::{apply_props, Doc};
+use crate::doc::{apply_props, Doc, ExternalChange};
 use crate::library::{self, lib};
 use crate::render::{build_scene, fit_view, scene_svg, svg_to_png, Decor, Overlay};
 use crate::schematic::Schematic;
@@ -9,7 +9,7 @@ use crate::sim::{self, SimResult};
 use base64::Engine as _;
 use serde_json::{json, Map, Value};
 use std::io::{BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 const INSTRUCTIONS: &str = "Qucs-S (Rust fork) schematic editor. Coordinates are Qucs units: x to the right, y DOWN, 10-unit grid. \
@@ -22,7 +22,6 @@ Large designs: create_subcircuit moves parts into their own file (open_subcircui
 
 pub struct Server {
     doc: Option<Doc>,
-    loaded_mtime: Option<SystemTime>,
     sim: Option<SimResult>,
     snap_counter: usize,
 }
@@ -164,26 +163,17 @@ fn gui_running() -> bool {
     std::fs::metadata(gui_heartbeat_path()).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).map(|d| d.as_secs_f64() < 3.0).unwrap_or(false)
 }
 
-fn mtime(p: &Path) -> Option<SystemTime> {
-    std::fs::metadata(p).and_then(|m| m.modified()).ok()
-}
-
 impl Server {
     pub fn new() -> Server {
-        Server { doc: None, loaded_mtime: None, sim: None, snap_counter: 0 }
+        Server { doc: None, sim: None, snap_counter: 0 }
     }
 
     fn doc(&mut self) -> Result<&mut Doc, String> {
         // pick up edits saved from the GUI
         if let Some(d) = &self.doc {
-            if let Some(p) = d.path.clone() {
-                let m = mtime(&p);
-                if m.is_some() && m != self.loaded_mtime {
-                    if let Ok(nd) = Doc::open(&p) {
-                        self.doc = Some(nd);
-                        self.loaded_mtime = m;
-                    }
-                }
+            if let Some(ExternalChange::Modified(bytes)) = d.external_change()? {
+                let path = d.path.as_deref().expect("external change has a path");
+                self.doc = Some(Doc::from_disk(path, bytes)?);
             }
         }
         self.doc.as_mut().ok_or_else(|| "no schematic open (new_schematic / open_schematic)".to_string())
@@ -192,8 +182,10 @@ impl Server {
     fn commit(&mut self) -> Result<(), String> {
         let d = self.doc.as_mut().ok_or("no schematic")?;
         if d.path.is_some() {
-            let p = d.save()?;
-            self.loaded_mtime = mtime(&p);
+            if let Err(e) = d.save() {
+                self.doc = d.last_saved();
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -213,30 +205,34 @@ impl Server {
         match name {
             "new_schematic" => {
                 let p = Self::resolve_path(s(a, "path").ok_or("path required")?);
-                if p.exists() && !b(a, "overwrite").unwrap_or(false) {
+                let overwrite = b(a, "overwrite").unwrap_or(false);
+                if p.exists() && !overwrite {
                     return Err(format!("{} exists (pass overwrite=true or use open_schematic)", p.display()));
                 }
                 let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "untitled".into());
-                self.doc = Some(Doc::new(Schematic::new_empty(&stem), Some(p.clone())));
+                let sch = Schematic::new_empty(&stem);
+                let mut doc = if overwrite { Doc::new(sch, Some(p.clone())) } else { Doc::for_new_file(sch, p.clone()) };
+                doc.save()?;
+                self.doc = Some(doc);
                 self.sim = None;
-                self.commit()?;
                 Ok(vec![text(&json!({"path": p.display().to_string()}))])
             }
             "open_schematic" => {
                 let p = Self::resolve_path(s(a, "path").ok_or("path required")?);
                 let d = Doc::open(&p)?;
-                self.loaded_mtime = mtime(&p);
                 self.doc = Some(d);
                 self.sim = None;
                 let info = self.schematic_json(false)?;
                 Ok(vec![text(&info)])
             }
             "save_schematic" => {
-                let d = self.doc()?;
                 if let Some(p) = s(a, "path") {
-                    d.path = Some(Self::resolve_path(p));
+                    let p = Self::resolve_path(p);
+                    self.doc()?.save_as(p)?;
+                } else {
+                    self.doc()?;
+                    self.commit()?;
                 }
-                self.commit()?;
                 let p = self.doc()?.path.clone().ok_or("no file name: pass path")?;
                 Ok(vec![text(&json!({"saved": p.display().to_string()}))])
             }
@@ -694,7 +690,6 @@ impl Server {
                 self.commit()?;
                 let p = crate::hier::sub_file(self.doc()?, &name)?;
                 let d = Doc::open(&p)?;
-                self.loaded_mtime = mtime(&p);
                 self.doc = Some(d);
                 self.sim = None;
                 let mut info = self.schematic_json(false)?;

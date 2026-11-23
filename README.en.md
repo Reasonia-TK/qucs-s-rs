@@ -49,7 +49,7 @@ powershell -ExecutionPolicy Bypass -File tools\package.ps1        # release zip 
 qucs-s-rs gui examples\inverting_amp.sch
 ```
 
-* Parts palette (220 built-in types + ~4,200 parts from the 70 Qucs-S libraries) on the left, properties on the right
+* The parts palette (220 built-in types and ~4,200 Qucs-S library parts) supports Japanese names, English names and part numbers. Pin parts from either list to the favorites palette.
 * Mouse wheel / `Ctrl +/-` zoom, middle/right drag pans, drag moves parts (wires are re-routed), `R` rotate, `M` mirror, `Del`,
   `W` wire, `A` auto-wire two pins, `L` net label, `F` / `Ctrl+0` fit, `Ctrl+Z/Y`, `Ctrl+S` / `Ctrl+Shift+S`, `Ctrl+F` find,
   `Ctrl+P` print, `F5` simulate, `F1` about
@@ -59,9 +59,10 @@ qucs-s-rs gui examples\inverting_amp.sch
 * **Hierarchy**: select parts → *Edit → Create subcircuit…* moves them into a new `.sch` (one `Port` per net that leaves the selection)
   and puts a wired `Sub` in their place; double-click a `Sub` to open it
 * Export PNG / SVG / PDF (A4); printing opens the PDF in the system viewer
-* Results: rectangular (AC in dB + phase), polar, Smith, table, markers, sweep overlays; Monte Carlo, filter / attenuator /
-  transmission-line design, parameter sweep and live tuning
-* **Auto-save (AI sync)**: edits are written immediately and picked up by the MCP server, and agent edits show up live
+* Circuit Check reports errors and warnings. Select a finding to locate it in the schematic and see repair guidance.
+* View results beside the schematic. Editing marks the last result as out of date. Reruns keep the selected analysis and signals where available, and compatible rectangular plots can overlay the previous run. Rectangular (AC in dB + phase), polar, Smith, table, markers and sweep overlays are available.
+* Simulation requires ngspice and an analysis setup. Name and save an untitled schematic from the run prompt. Edits to an already named schematic can be simulated from a temporary copy.
+* **Auto-save (AI sync)** picks up edits through the MCP server. If a file changes while the editor has unsaved changes, review both versions and keep local changes in a separate schematic before loading the external version.
 
 ## MCP server
 

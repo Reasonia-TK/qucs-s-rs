@@ -200,7 +200,7 @@ impl Wire {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Schematic {
     pub version: String,
     pub properties: Vec<String>,
@@ -326,6 +326,26 @@ impl Schematic {
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
+        self.write(path, None).map(|_| ())
+    }
+
+    pub fn save_if_current(&self, path: &Path, expected: Option<&[u8]>) -> Result<Vec<u8>, String> {
+        self.write(path, Some(expected))
+    }
+
+    fn write(&self, path: &Path, expected: Option<Option<&[u8]>>) -> Result<Vec<u8>, String> {
+        // The editor and MCP server use the same lock, so checking and replacing a
+        // file are one operation for app writers. The OS releases it on process exit.
+        let lock_path = std::env::temp_dir().join("qucs-s-rs-schematic.lock");
+        let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(lock_path)
+            .map_err(|e| format!("cannot open schematic write lock: {e}"))?;
+        lock.lock().map_err(|e| format!("cannot lock schematic for writing: {e}"))?;
+        if let Some(expected) = expected {
+            let current = read_file(path)?;
+            if current.as_deref() != expected {
+                return Err(format!("schematic changed on disk: {}", path.display()));
+            }
+        }
         if let Some(dir) = path.parent() {
             if !dir.as_os_str().is_empty() {
                 std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -333,8 +353,10 @@ impl Schematic {
         }
         // write to a temp file first so a GUI watching the file never sees a half file
         let tmp = path.with_extension("sch.tmp");
-        std::fs::write(&tmp, self.serialize()).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, path).map_err(|e| format!("cannot write {}: {e}", path.display()))
+        let bytes = self.serialize().into_bytes();
+        std::fs::write(&tmp, &bytes).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, path).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        Ok(bytes)
     }
 
     pub fn component(&self, name: &str) -> Option<&Component> {
@@ -345,6 +367,14 @@ impl Schematic {
     }
     pub fn component_index(&self, name: &str) -> Option<usize> {
         self.components.iter().position(|c| c.name == name)
+    }
+}
+
+pub fn read_file(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
     }
 }
 

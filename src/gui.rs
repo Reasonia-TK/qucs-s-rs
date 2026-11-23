@@ -2,17 +2,21 @@
 //! follows the .sch file live, so the user can watch – and correct – the agent.
 
 use crate::check::{self, Issue};
-use crate::doc::{snap, Doc};
+use crate::doc::{same_path, snap, Doc, ExternalChange};
 use crate::library::{self, lib};
 use crate::netlist::Connectivity;
 use crate::render::{build_scene, Color, Overlay, Scene, Shape};
 use crate::schematic::Schematic;
-use crate::sim::{self, SimResult};
+use crate::sim;
 use crate::theme::{self, Palette};
 use egui::{Align2, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
+
+#[path = "gui_sim.rs"]
+mod simulation;
+use simulation::{SimulationJob, SimulationView};
 
 #[cfg(windows)]
 extern "system" {
@@ -63,6 +67,13 @@ enum Tool {
     Paint(String),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaletteTab {
+    Favorites,
+    Parts,
+    Library,
+}
+
 /// What a primary-button drag in the select tool is moving.
 enum Grab {
     WireLabel { wire: usize, orig: (i32, i32), start: (f64, f64) },
@@ -104,30 +115,29 @@ struct App {
     place_rot: i32,
     query: String,
     lib_query: String,
-    palette_tab: u8,
+    palette_tab: PaletteTab,
     color_nets: bool,
     pin_names: bool,
     show_issues: bool,
     show_grid: bool,
     auto_save: bool,
     auto_reroute: bool,
-    disk_mtime: Option<SystemTime>,
     last_poll: Instant,
     external_change: bool,
+    external_review: Option<Result<Doc, String>>,
     status: String,
     issues: Vec<Issue>,
     show_issue_panel: bool,
-    sim_rx: Option<(u64, Receiver<Result<SimResult, String>>)>,
-    sim: Option<SimResult>,
-    show_sim: bool,
-    plot_analysis: usize,
-    plot_vectors: Vec<String>,
-    plot_tex: Option<egui::TextureHandle>,
-    plot_dirty: bool,
+    issue_focus: Option<(f64, f64)>,
+    center_on_issue: bool,
+    sim_job: Option<SimulationJob>,
+    simulation: SimulationView,
+    simulation_panel_visible: bool,
     theme_pref: egui::ThemePreference,
     /// Theme the scene and plot textures were built for.
     tex_theme: egui::Theme,
     prop_for: Option<usize>,
+    property_editing: bool,
     prop_buf: Vec<String>,
     name_buf: String,
     label_prompt: Option<(String, String)>, // (terminal, text)
@@ -135,11 +145,6 @@ struct App {
     last_state: String,
     last_state_write: Instant,
     icons: std::collections::HashMap<String, (Vec<Shape>, [f64; 4])>,
-    diag_kind: crate::diagram::DiagramKind,
-    markers: Vec<f64>,
-    marker_out: serde_json::Value,
-    plot_area: Option<(f64, f64, f64, f64, f64, f64, bool)>,
-    plot_px: (f32, f32),
     tools: Tools,
     // ---- tabs: the active document lives in the fields above, the others here
     tab_id: u64,
@@ -205,20 +210,14 @@ struct TabState {
     sel: Vec<usize>,
     sel_wires: Vec<usize>,
     sel_paint: Vec<usize>,
-    disk_mtime: Option<SystemTime>,
     external_change: bool,
     issues: Vec<Issue>,
-    sim: Option<SimResult>,
-    show_sim: bool,
-    plot_analysis: usize,
-    plot_vectors: Vec<String>,
-    markers: Vec<f64>,
+    simulation: SimulationView,
 }
 
 impl TabState {
     fn new(doc: Doc, id: u64) -> TabState {
         let conn = doc.conn();
-        let disk_mtime = doc.path.as_ref().and_then(mtime);
         TabState {
             tab_id: id,
             doc,
@@ -231,14 +230,9 @@ impl TabState {
             sel: vec![],
             sel_wires: vec![],
             sel_paint: vec![],
-            disk_mtime,
             external_change: false,
             issues: vec![],
-            sim: None,
-            show_sim: false,
-            plot_analysis: 0,
-            plot_vectors: vec![],
-            markers: vec![],
+            simulation: SimulationView::default(),
         }
     }
 }
@@ -424,10 +418,6 @@ impl Default for Tools {
     }
 }
 
-fn mtime(p: &PathBuf) -> Option<SystemTime> {
-    std::fs::metadata(p).and_then(|m| m.modified()).ok()
-}
-
 fn load_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let candidates = [
@@ -575,16 +565,16 @@ impl App {
                 status = format!("読み込みエラー: {e}");
                 Doc::new(Schematic::new_empty("untitled"), Some(p.clone()))
             }),
-            Some(p) => Doc::new(Schematic::new_empty(&p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()), Some(p.clone())),
+            Some(p) => Doc::for_new_file(Schematic::new_empty(&p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()), p.clone()),
             None => Doc::new(Schematic::new_empty("untitled"), None),
         };
         let conn = doc.conn();
-        let disk_mtime = doc.path.as_ref().and_then(mtime);
         let mut settings = settings;
         if let Some(p) = doc.path.as_ref().filter(|p| p.exists()) {
             settings.add_recent(p);
             settings.save();
         }
+        let issues = if settings.show_issues { check::check(&doc.sch, &conn).issues } else { vec![] };
         App {
             conn,
             doc,
@@ -608,29 +598,28 @@ impl App {
             place_rot: 0,
             query: String::new(),
             lib_query: String::new(),
-            palette_tab: 0,
+            palette_tab: PaletteTab::Favorites,
             color_nets: settings.color_nets,
             pin_names: settings.pin_names,
             show_issues: settings.show_issues,
             show_grid: settings.show_grid,
             auto_save: settings.auto_save,
             auto_reroute: settings.auto_reroute,
-            disk_mtime,
             last_poll: Instant::now(),
             external_change: false,
+            external_review: None,
             status: if status.is_empty() { "準備完了".into() } else { status },
-            issues: vec![],
+            issues,
             show_issue_panel: false,
-            sim_rx: None,
-            sim: None,
-            show_sim: false,
-            plot_analysis: 0,
-            plot_vectors: vec![],
-            plot_tex: None,
-            plot_dirty: false,
+            issue_focus: None,
+            center_on_issue: false,
+            sim_job: None,
+            simulation: SimulationView::default(),
+            simulation_panel_visible: false,
             theme_pref,
             tex_theme: cc.egui_ctx.theme(),
             prop_for: None,
+            property_editing: false,
             prop_buf: vec![],
             name_buf: String::new(),
             label_prompt: None,
@@ -638,11 +627,6 @@ impl App {
             last_state: String::new(),
             last_state_write: Instant::now(),
             icons: Default::default(),
-            diag_kind: crate::diagram::DiagramKind::Rect,
-            markers: vec![],
-            marker_out: serde_json::Value::Null,
-            plot_area: None,
-            plot_px: (0.0, 0.0),
             tools: Tools::default(),
             tab_id: 1,
             next_tab_id: 2,
@@ -699,7 +683,7 @@ impl App {
             }
         }
         // screenshot once background work is done
-        let busy = self.op_rx.is_some() || self.sim_rx.is_some();
+        let busy = self.op_rx.is_some() || self.sim_job.is_some() || self.simulation.queued;
         if let Some(sh) = self.shot.as_mut() {
             if frame > 30 && !busy && !sh.requested {
                 sh.requested = true;
@@ -734,14 +718,14 @@ impl App {
         }
     }
 
-    /// Edits that would be lost: not saved to disk (auto-save only covers named files).
+    /// Auto-save may be blocked by a conflict or a write error.
     fn unsaved(&self, d: &Doc) -> bool {
-        d.dirty && (d.path.is_none() || !self.auto_save)
+        d.dirty
     }
 
     fn tab_unsaved(&self, i: usize) -> bool {
         if i == self.active {
-            self.unsaved(&self.doc)
+            self.unsaved(&self.doc) || self.buffered_property_edit().is_some()
         } else {
             self.tabs.get(i).and_then(|t| t.as_ref()).map(|t| self.unsaved(&t.doc)).unwrap_or(false)
         }
@@ -752,14 +736,16 @@ impl App {
         if self.doc.path.is_none() {
             return self.save_as();
         }
+        self.finish_buffered_property_edit();
         match self.doc.save() {
             Ok(p) => {
-                self.disk_mtime = mtime(&p);
+                self.external_change = false;
+                self.external_review = None;
                 self.status = format!("保存: {}", p.display());
                 true
             }
             Err(e) => {
-                self.status = format!("保存エラー: {e}");
+                self.report_save_error(e);
                 false
             }
         }
@@ -780,46 +766,82 @@ impl App {
     // ------------------------------------------------------------------ model sync
 
     fn changed(&mut self) {
+        self.refresh_after_edit();
+        self.auto_save_current();
+    }
+
+    fn auto_save_current(&mut self) {
+        if self.auto_save && self.doc.path.is_some() {
+            if let Err(e) = self.doc.save() {
+                self.report_save_error(e);
+            }
+        }
+    }
+
+    fn refresh_after_edit(&mut self) {
         self.gen += 1;
         self.conn = self.doc.conn();
         self.sel.retain(|&i| i < self.doc.sch.components.len());
         self.sel_wires.retain(|&i| i < self.doc.sch.wires.len());
         self.prop_for = None;
-        if self.show_issues {
-            self.issues = check::check(&self.doc.sch, &self.conn).issues;
-        }
-        if self.auto_save && self.doc.path.is_some() {
-            match self.doc.save() {
-                Ok(p) => self.disk_mtime = mtime(&p),
-                Err(e) => self.status = format!("保存エラー: {e}"),
-            }
+        self.property_editing = false;
+        if self.show_issues || self.show_issue_panel {
+            self.refresh_issues();
         }
     }
 
-    fn reload_from_disk(&mut self) {
-        if let Some(p) = self.doc.path.clone() {
-            match Doc::open(&p) {
-                Ok(d) => {
-                    let was_empty = self.doc.sch.components.is_empty();
-                    self.doc = d;
-                    self.disk_mtime = mtime(&p);
-                    if was_empty {
-                        self.need_fit = true;
-                    }
-                    self.gen += 1;
-                    self.conn = self.doc.conn();
-                    self.sel.clear();
-                    self.sel_wires.clear();
-                    self.prop_for = None;
-                    if self.show_issues {
-                        self.issues = check::check(&self.doc.sch, &self.conn).issues;
-                    }
-                    self.external_change = false;
-                    self.status = "ファイルの変更（AIエージェント等）を反映しました".into();
-                }
-                Err(e) => self.status = format!("再読み込み失敗: {e}"),
-            }
+    fn buffered_property_edit(&self) -> Option<usize> {
+        let index = self.prop_for?;
+        let component = self.doc.sch.components.get(index)?;
+        let changed_name = !self.name_buf.is_empty() && self.name_buf != component.name;
+        let changed_value = component.props.iter().zip(&self.prop_buf).any(|(prop, value)| prop.value != *value);
+        (changed_name || changed_value).then_some(index)
+    }
+
+    fn finish_buffered_property_edit(&mut self) -> bool {
+        let Some(index) = self.buffered_property_edit() else { return false };
+        self.doc.checkpoint();
+        let component = &mut self.doc.sch.components[index];
+        if !self.name_buf.is_empty() {
+            component.name.clone_from(&self.name_buf);
         }
+        for (prop, value) in component.props.iter_mut().zip(&self.prop_buf) {
+            prop.value.clone_from(value);
+        }
+        self.refresh_after_edit();
+        true
+    }
+
+    fn report_save_error(&mut self, error: String) {
+        if matches!(self.doc.external_change(), Ok(Some(_))) {
+            self.external_change = true;
+            self.status = "外部変更があるため保存を保留しました".into();
+        } else {
+            self.status = format!("保存エラー: {error}");
+        }
+    }
+
+    fn install_external(&mut self, doc: Doc) {
+        self.need_fit |= self.doc.sch.components.is_empty();
+        self.doc = doc;
+        self.gen += 1;
+        self.conn = self.doc.conn();
+        self.sel.clear();
+        self.sel_wires.clear();
+        self.sel_paint.clear();
+        self.drag = None;
+        self.grab = None;
+        self.box_start = None;
+        self.wire_pts.clear();
+        self.autowire_first = None;
+        self.prop_for = None;
+        self.property_editing = false;
+        if self.show_issues || self.show_issue_panel {
+            self.refresh_issues();
+        }
+        self.external_change = false;
+        self.external_review = None;
+        self.status = "ファイルの外部変更を反映しました".into();
     }
 
     fn poll_disk(&mut self) {
@@ -827,13 +849,113 @@ impl App {
             return;
         }
         self.last_poll = Instant::now();
-        let Some(p) = self.doc.path.clone() else { return };
-        let m = mtime(&p);
-        if m.is_some() && m != self.disk_mtime {
-            if self.doc.dirty && !self.auto_save {
-                self.external_change = true;
-            } else {
-                self.reload_from_disk();
+        let Some(path) = self.doc.path.as_deref() else { return };
+        match self.doc.external_change() {
+            Ok(None) => {
+                self.external_change = false;
+                self.external_review = None;
+            }
+            Ok(Some(ExternalChange::Modified(bytes))) if !self.doc.dirty && !self.has_pending_edits() => {
+                match Doc::from_disk(path, bytes) {
+                    Ok(doc) => self.install_external(doc),
+                    Err(_) => self.external_change = true,
+                }
+            }
+            Ok(Some(_)) | Err(_) => self.external_change = true,
+        }
+    }
+
+    fn has_pending_edits(&self) -> bool {
+        self.property_editing
+            || self.buffered_property_edit().is_some()
+            || self.drag.is_some()
+            || self.grab.is_some()
+            || self.paint_start.is_some()
+            || !self.wire_pts.is_empty()
+            || self.autowire_first.is_some()
+            || self.text_prompt.is_some()
+            || self.label_prompt.is_some()
+            || self.external_review.is_some()
+    }
+
+    fn external_change_dialog(&mut self, ctx: &egui::Context) {
+        let Some(review) = self.external_review.as_ref() else { return };
+        let mut recover = false;
+        let mut save_as = false;
+        let mut close = false;
+        let modal = egui::Modal::new(egui::Id::new("external-change-review")).show(ctx, |ui| {
+            ui.set_width(480.0);
+            ui.heading("外部変更を確認");
+            ui.label("元のファイルへの保存を保留しています。ローカル版を別の回路図として保存できます。");
+            match review {
+                Ok(external) => {
+                    ui.separator();
+                    ui.label("現在のローカル版と外部版の違い");
+                    let local = &self.doc.sch;
+                    let disk = &external.sch;
+                    let local_parts: std::collections::HashMap<_, _> = local.components.iter().map(|part| (part.name.as_str(), part)).collect();
+                    let external_names: std::collections::HashSet<_> = disk.components.iter().map(|part| part.name.as_str()).collect();
+                    let added = disk.components.iter().filter(|part| !local_parts.contains_key(part.name.as_str())).map(|part| part.name.as_str());
+                    let changed = disk.components.iter().filter(|part| local_parts.get(part.name.as_str()).is_some_and(|old| *old != *part)).map(|part| part.name.as_str());
+                    let removed = local.components.iter().filter(|part| !external_names.contains(part.name.as_str())).map(|part| part.name.as_str());
+                    for (label, names) in [("追加された部品", added.collect::<Vec<_>>()), ("変更された部品", changed.collect()), ("削除された部品", removed.collect())] {
+                        if !names.is_empty() {
+                            let summary = names[..names.len().min(8)].join("、");
+                            let more = if names.len() > 8 { format!(" ほか{}個", names.len() - 8) } else { String::new() };
+                            ui.label(format!("{label}　{summary}{more}"));
+                        }
+                    }
+                    if local.wires != disk.wires {
+                        ui.label(format!("配線が変更されています（{}本 → {}本）", local.wires.len(), disk.wires.len()));
+                    }
+                    if local.properties != disk.properties || local.symbol != disk.symbol || local.diagrams != disk.diagrams || local.paintings != disk.paintings || local.extra_sections != disk.extra_sections {
+                        ui.label("回路図の設定・表示項目にも差があります。");
+                    }
+                    ui.small("退避ファイルは元の回路図と同じフォルダに作成され、別のタブで開きます。");
+                }
+                Err(error) => {
+                    ui.colored_label(ui.visuals().error_fg_color, "外部版を読み込めません。");
+                    ui.small(error);
+                }
+            }
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                recover = ui.add_enabled(review.is_ok(), egui::Button::new("ローカル版を退避して外部版を開く")).clicked();
+                save_as = ui.button("ローカル版を別名で保存…").clicked();
+                close = ui.button("編集に戻る").clicked();
+            });
+        });
+        if recover {
+            self.recover_external_change();
+        } else if save_as {
+            self.save_as();
+        } else if close || modal.should_close() {
+            self.external_review = None;
+        }
+    }
+
+    fn recover_external_change(&mut self) {
+        let Some(Ok(external)) = self.external_review.take() else { return };
+        match external.external_change() {
+            Ok(None) => {}
+            Ok(Some(_)) | Err(_) => {
+                self.external_review = self.doc.path.as_deref().map(Doc::open);
+                self.status = "確認中に外部版が更新されました。変更内容をもう一度確認してください".into();
+                return;
+            }
+        }
+        self.finish_buffered_property_edit();
+        match self.doc.save_conflict_draft() {
+            Ok(draft) => {
+                let original_tab = self.active;
+                self.install_external(external);
+                self.open_path(&draft);
+                self.switch_tab(original_tab);
+                self.status = format!("外部版を開きました。ローカル版の退避先: {}", draft.display());
+            }
+            Err(e) => {
+                self.status = format!("ローカル版を退避できません: {e}");
+                self.external_review = Some(Ok(external));
             }
         }
     }
@@ -1122,42 +1244,19 @@ impl App {
         self.changed();
     }
 
-    /// The file a simulation reads. With auto-save on it is the document itself (saved
-    /// first); otherwise unsaved edits go to a temporary copy next to it, so that trying
-    /// values never overwrites the .sch. Returns (file to simulate, copy to delete afterwards).
+    /// Input for operating point and Monte Carlo. Keep edits off disk except for the
+    /// calculation's temporary copy, which lives beside the original for relative references.
     fn sim_source(&mut self, kind: &str) -> Result<(PathBuf, Option<PathBuf>), String> {
-        let p = self.doc.path.clone().ok_or_else(|| "先に保存してください".to_string())?;
-        if self.auto_save {
-            self.doc.save()?;
-            self.disk_mtime = mtime(&p);
-            return Ok((p, None));
+        if self.finish_buffered_property_edit() {
+            self.auto_save_current();
         }
+        let p = self.doc.path.clone().ok_or_else(|| "先に保存してください".to_string())?;
         if !self.doc.dirty {
             return Ok((p, None));
         }
         let tmp = sim::unsaved_copy_path(&p, kind)?;
         self.doc.sch.save(&tmp)?;
         Ok((tmp.clone(), Some(tmp)))
-    }
-
-    fn run_sim(&mut self) {
-        let (p, tmp) = match self.sim_source("sim") {
-            Ok(x) => x,
-            Err(e) => {
-                self.status = e;
-                return;
-            }
-        };
-        let (tx, rx) = channel();
-        std::thread::spawn(move || {
-            let r = sim::simulate(&p, 300);
-            if let Some(t) = tmp {
-                let _ = std::fs::remove_file(t);
-            }
-            let _ = tx.send(r);
-        });
-        self.sim_rx = Some((self.tab_id, rx));
-        self.status = "シミュレーション実行中…".into();
     }
 
     fn open_dialog(&mut self) {
@@ -1353,11 +1452,8 @@ impl App {
 
     fn create_subcircuit(&mut self, file: &str) {
         let names: Vec<String> = self.sel.iter().filter_map(|&i| self.doc.sch.components.get(i)).map(|c| c.name.clone()).collect();
-        if self.doc.dirty {
-            if let Err(e) = self.doc.save() {
-                self.status = e;
-                return;
-            }
+        if self.doc.dirty && !self.save_current() {
+            return;
         }
         self.doc.checkpoint();
         match crate::hier::create_subcircuit(&mut self.doc, &names, file, false) {
@@ -1571,6 +1667,9 @@ impl App {
     // ------------------------------------------------------------------ tabs
 
     fn stash_tab(&mut self) -> TabState {
+        if self.finish_buffered_property_edit() {
+            self.auto_save_current();
+        }
         TabState {
             tab_id: self.tab_id,
             doc: std::mem::replace(&mut self.doc, Doc::new(Schematic::new_empty("untitled"), None)),
@@ -1583,14 +1682,9 @@ impl App {
             sel: std::mem::take(&mut self.sel),
             sel_wires: std::mem::take(&mut self.sel_wires),
             sel_paint: std::mem::take(&mut self.sel_paint),
-            disk_mtime: self.disk_mtime,
             external_change: self.external_change,
             issues: std::mem::take(&mut self.issues),
-            sim: self.sim.take(),
-            show_sim: self.show_sim,
-            plot_analysis: self.plot_analysis,
-            plot_vectors: std::mem::take(&mut self.plot_vectors),
-            markers: std::mem::take(&mut self.markers),
+            simulation: std::mem::take(&mut self.simulation),
         }
     }
 
@@ -1609,14 +1703,10 @@ impl App {
         self.sel = t.sel;
         self.sel_wires = t.sel_wires;
         self.sel_paint = t.sel_paint;
-        self.disk_mtime = t.disk_mtime;
         self.external_change = t.external_change;
+        self.external_review = None;
         self.issues = t.issues;
-        self.sim = t.sim;
-        self.show_sim = t.show_sim;
-        self.plot_analysis = t.plot_analysis;
-        self.plot_vectors = t.plot_vectors;
-        self.markers = t.markers;
+        self.simulation = t.simulation;
         // transient interaction state belongs to no tab
         self.drag = None;
         self.grab = None;
@@ -1625,13 +1715,13 @@ impl App {
         self.autowire_first = None;
         self.paint_start = None;
         self.prop_for = None;
-        self.plot_tex = None;
-        self.plot_dirty = true;
-        self.marker_out = serde_json::Value::Null;
-        self.plot_area = None;
+        self.property_editing = false;
+        self.simulation.invalidate_chart();
         self.last_poll = Instant::now() - std::time::Duration::from_secs(1);
-        if self.show_issues {
-            self.issues = check::check(&self.doc.sch, &self.conn).issues;
+        self.issue_focus = None;
+        self.center_on_issue = false;
+        if self.show_issues || self.show_issue_panel {
+            self.refresh_issues();
         }
     }
 
@@ -1671,7 +1761,8 @@ impl App {
             return;
         }
         if self.tabs.len() == 1 {
-            let id = self.tab_id;
+            let id = self.next_tab_id;
+            self.next_tab_id += 1;
             self.install_tab(TabState::new(Doc::new(Schematic::new_empty("untitled"), None), id));
             return;
         }
@@ -1907,18 +1998,24 @@ impl App {
         if p.extension().is_none() {
             p.set_extension("sch");
         }
-        let old = self.doc.path.replace(p.clone());
-        match self.doc.save() {
+        if self.tabs.iter().flatten().any(|t| t.doc.path.as_ref().is_some_and(|path| same_path(path, &p))) {
+            self.status = "別のタブですでに開いている回路図です。別のファイル名を指定してください".into();
+            return false;
+        }
+        self.finish_buffered_property_edit();
+        match self.doc.save_as(p.clone()) {
             Ok(_) => {
-                self.disk_mtime = mtime(&p);
+                self.external_change = false;
+                self.external_review = None;
+                self.conn = self.doc.conn();
+                self.gen += 1;
                 self.status = format!("保存: {}", p.display());
                 self.settings.add_recent(&p);
                 self.settings.save();
                 true
             }
             Err(e) => {
-                self.doc.path = old;
-                self.status = format!("保存エラー: {e}");
+                self.report_save_error(e);
                 false
             }
         }
@@ -1938,7 +2035,7 @@ impl App {
             selected: self.sel.clone(),
             selected_wires: self.sel_wires.clone(),
             markers: if self.show_issues {
-                self.issues.iter().filter(|i| i.severity == "error").map(|i| (i.at.0, i.at.1, i.message.clone())).collect()
+                self.issues.iter().filter(|i| i.severity == "error").map(|i| (i.at.0, i.at.1, i.summary_ja.clone())).collect()
             } else {
                 vec![]
             },
@@ -2006,7 +2103,7 @@ impl App {
         .on_hover_text("表示テーマ");
     }
 
-    fn toolbar(&mut self, ui: &mut egui::Ui, canvas_hint: Rect) {
+    fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             if ui.button("📂 開く").on_hover_text("Ctrl+O").clicked() {
                 self.open_dialog();
@@ -2075,9 +2172,8 @@ impl App {
                 self.changed();
             }
             if ui.button("🔍 チェック").clicked() {
-                self.issues = check::check(&self.doc.sch, &self.conn).issues;
                 self.show_issue_panel = true;
-                self.show_issues = true;
+                self.refresh_issues();
                 self.gen += 1;
             }
             let pal = self.pal();
@@ -2160,7 +2256,7 @@ impl App {
                 }
             });
             if ui.button("⛶ 全体表示").on_hover_text("F").clicked() {
-                self.fit(canvas_hint);
+                self.need_fit = true;
             }
             ui.separator();
             let mut ch = false;
@@ -2171,7 +2267,7 @@ impl App {
             other |= ui.checkbox(&mut self.auto_reroute, "移動時に再配線").changed();
             other |= ui.checkbox(&mut self.auto_save, "自動保存 (AI同期)").on_hover_text("編集を即座に保存し、MCP 側（AIエージェント）と同じファイルを共有します").changed();
             if ch && self.show_issues {
-                self.issues = check::check(&self.doc.sch, &self.conn).issues;
+                self.refresh_issues();
             }
             if ch || other {
                 self.store_settings();
@@ -2198,111 +2294,190 @@ impl App {
         })
     }
 
-    /// Palette entry: symbol icon + name, like the Qucs-S component list.
-    fn palette_row(&mut self, ui: &mut egui::Ui, typ: &str, caption: &str, sub_line: &str, selected: bool) -> egui::Response {
+    fn palette_entry(&mut self, ui: &mut egui::Ui, typ: &str, caption: &str, sub_line: &str, description: &str) {
         const ICON: Vec2 = Vec2::new(46.0, 34.0);
-        let w = ui.available_width();
-        // lay the text out first: long captions wrap, and the row grows to fit them
-        let text_color = ui.visuals().text_color();
-        let galley = ui.painter().layout(format!("{caption}\n{sub_line}"), FontId::proportional(12.5), text_color, (w - ICON.x - 12.0).max(40.0));
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, ICON.y.max(galley.size().y) + 4.0), Sense::click());
-        if !ui.is_rect_visible(rect) {
-            return resp;
+        const FAVORITE_SIZE: f32 = 26.0;
+
+        let favorite_index = self.settings.part_favorites.iter().position(|key| key == typ);
+        let width = ui.available_width().min(ui.clip_rect().right() - ui.cursor().left()).max(0.0);
+        let favorite_width = FAVORITE_SIZE.min(width);
+        let part_width = (width - favorite_width - ui.spacing().item_spacing.x).max(0.0);
+        let text = ui.painter().layout(
+            format!("{caption}\n{sub_line}"),
+            FontId::proportional(12.5),
+            ui.visuals().text_color(),
+            (part_width - ICON.x - 12.0).max(16.0),
+        );
+        // One allocation keeps the scroll area within the palette, even if a label or star
+        // needs more room than its assigned rectangle.
+        let (_, row) = ui.allocate_space(Vec2::new(width, ICON.y.max(text.size().y) + 4.0));
+        if !ui.is_rect_visible(row) {
+            return;
         }
-        let vis = ui.style().interact_selectable(&resp, selected);
-        if selected || resp.hovered() {
-            ui.painter().rect_filled(rect, 3.0, vis.weak_bg_fill);
+        let part_rect = Rect::from_min_size(row.min, Vec2::new(part_width, row.height()));
+        let favorite_rect = Rect::from_center_size(
+            Pos2::new(row.right() - favorite_width / 2.0, row.center().y),
+            Vec2::new(favorite_width, FAVORITE_SIZE),
+        );
+        let id = ui.make_persistent_id(typ);
+        let selected = matches!(&self.tool, Tool::Place(key) if key == typ);
+        let part = ui.interact(part_rect, id, Sense::click());
+        part.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), selected, caption));
+        let part_visuals = ui.style().interact_selectable(&part, selected);
+        let painter = ui.painter().with_clip_rect(part_rect);
+        if selected || part.hovered() || part.has_focus() {
+            painter.rect_filled(part_rect, 3.0, part_visuals.weak_bg_fill);
         }
-        let icon_rect = Rect::from_center_size(Pos2::new(rect.min.x + 2.0 + ICON.x / 2.0, rect.center().y), ICON);
-        let (shapes, bb) = self.icon(typ).clone();
-        let (bw, bh) = ((bb[2] - bb[0]).max(1.0), (bb[3] - bb[1]).max(1.0));
-        let scale = ((ICON.x as f64 - 4.0) / bw).min((ICON.y as f64 - 4.0) / bh).min(0.8);
-        let (cx, cy) = ((bb[0] + bb[2]) / 2.0, (bb[1] + bb[3]) / 2.0);
+        let icon_rect = Rect::from_center_size(Pos2::new(row.left() + 2.0 + ICON.x / 2.0, row.center().y), ICON);
+        let (shapes, bounds) = self.icon(typ).clone();
+        let (symbol_w, symbol_h) = ((bounds[2] - bounds[0]).max(1.0), (bounds[3] - bounds[1]).max(1.0));
+        let scale = ((f64::from(ICON.x) - 4.0) / symbol_w).min((f64::from(ICON.y) - 4.0) / symbol_h).min(0.8);
+        let (cx, cy) = ((bounds[0] + bounds[2]) / 2.0, (bounds[1] + bounds[3]) / 2.0);
         let center = icon_rect.center();
-        let painter = ui.painter().with_clip_rect(icon_rect);
-        paint_shapes_xf(&painter, &shapes, 1.0, scale as f32, &|x, y| center + Vec2::new(((x - cx) * scale) as f32, ((y - cy) * scale) as f32));
-        let text_pos = Pos2::new(icon_rect.max.x + 6.0, rect.center().y);
-        ui.painter().galley(text_pos - Vec2::new(0.0, galley.size().y / 2.0), galley, vis.text_color());
-        resp
+        let icon_painter = painter.with_clip_rect(icon_rect);
+        paint_shapes_xf(&icon_painter, &shapes, 1.0, scale as f32, &|x, y| center + Vec2::new(((x - cx) * scale) as f32, ((y - cy) * scale) as f32));
+        let text_pos = Pos2::new(icon_rect.right() + 6.0, row.center().y - text.size().y / 2.0);
+        painter.galley(text_pos, text, part_visuals.text_color());
+        if part.on_hover_text(description).clicked() {
+            self.place_rot = spec_component(typ, 0, 0).map(|c| c.rotate).unwrap_or(0);
+            self.tool = Tool::Place(typ.to_string());
+        }
+
+        let (star, action) = if favorite_index.is_some() {
+            ("★", "よく使う部品から外す")
+        } else {
+            ("☆", "よく使う部品に追加")
+        };
+        let favorite = ui.interact(favorite_rect, id.with("favorite"), Sense::click());
+        favorite.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), action));
+        let star_visuals = ui.style().interact(&favorite);
+        let painter = ui.painter().with_clip_rect(favorite_rect);
+        painter.rect(favorite_rect, 3.0, star_visuals.weak_bg_fill, star_visuals.bg_stroke, egui::StrokeKind::Inside);
+        painter.text(favorite_rect.center(), Align2::CENTER_CENTER, star, FontId::proportional(14.0), star_visuals.text_color());
+        if favorite.on_hover_text(action).clicked() {
+            if let Some(index) = favorite_index {
+                self.settings.part_favorites.remove(index);
+            } else {
+                self.settings.part_favorites.push(typ.to_string());
+            }
+            self.settings.save();
+        }
+    }
+
+    fn builtin_palette_entry(&mut self, ui: &mut egui::Ui, part: &library::CompInfo) {
+        self.palette_entry(ui, &part.typ, crate::palette::caption(part), &part.typ, &part.description);
     }
 
     fn palette(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.palette_tab, 0, egui::RichText::new("部品").heading());
-            ui.selectable_value(&mut self.palette_tab, 1, egui::RichText::new("ライブラリ").heading());
+        use PaletteTab::{Favorites, Library, Parts};
+
+        ui.horizontal_wrapped(|ui| {
+            for (tab, label) in [(Favorites, "よく使う"), (Parts, "部品"), (Library, "ライブラリ")] {
+                if ui.selectable_value(&mut self.palette_tab, tab, label).clicked() && tab == Favorites {
+                    self.query.clear();
+                }
+            }
         });
-        if self.palette_tab == 1 {
+        if self.palette_tab == Library {
             self.library_browser(ui);
             return;
         }
-        ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("検索 (R, opamp, diode…)"));
-        let q = self.query.to_ascii_lowercase();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            let mut cats: Vec<String> = lib().comps.iter().map(|c| c.category.clone()).collect();
-            cats.sort();
-            cats.dedup();
-            for cat in cats {
-                let items: Vec<&library::CompInfo> = lib()
-                    .comps
-                    .iter()
-                    .filter(|c| c.category == cat)
-                    .filter(|c| q.is_empty() || format!("{} {} {}", c.typ, c.caption, c.description).to_ascii_lowercase().contains(&q))
-                    .collect();
-                if items.is_empty() {
-                    continue;
+
+        ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("部品を検索（抵抗、電源、R）"));
+        let query = crate::palette::search_text(self.query.trim());
+        let scroll_id = if !query.is_empty() { "part_search" } else if self.palette_tab == Favorites { "favorites" } else { "parts" };
+        egui::ScrollArea::vertical().id_salt(scroll_id).show(ui, |ui| {
+            if !query.is_empty() {
+                let mut matches: Vec<_> = lib().comps.iter().filter(|part| crate::palette::matches(part, &query)).collect();
+                matches.sort_by_key(|part| (!part.typ.eq_ignore_ascii_case(&query), !self.settings.part_favorites.contains(&part.typ)));
+                if matches.is_empty() {
+                    ui.label("該当する部品がありません。");
                 }
-                egui::CollapsingHeader::new(format!("{cat} ({})", items.len())).default_open(!q.is_empty() || cat == "lumped components" || cat == "sources").show(ui, |ui| {
-                    for c in items {
-                        let selected = self.tool == Tool::Place(c.typ.clone());
-                        if self.palette_row(ui, &c.typ, &c.caption, &c.typ, selected).on_hover_text(&c.description).clicked() {
-                            self.tool = Tool::Place(c.typ.clone());
-                            self.place_rot = library::new_component(&c.typ, "X", 0, 0).map(|c| c.rotate).unwrap_or(0);
+                for part in matches {
+                    self.builtin_palette_entry(ui, part);
+                }
+            } else if self.palette_tab == Favorites {
+                let favorites = self.settings.part_favorites.clone();
+                let mut available = false;
+                for key in favorites {
+                    if let Some(part) = lib().info(&key) {
+                        available = true;
+                        self.builtin_palette_entry(ui, part);
+                    } else if let Some((lib, name)) = key.strip_prefix("Lib:").and_then(|key| key.split_once('/')) {
+                        if let Some((_, part)) = crate::qlib::find(lib, name) {
+                            available = true;
+                            self.palette_entry(ui, &key, &part.name, lib, &part.description);
                         }
                     }
+                }
+                if !available {
+                    ui.label("部品やライブラリの ☆ から登録できます。");
+                }
+            } else {
+                let mut groups = std::collections::BTreeMap::<&str, Vec<_>>::new();
+                for part in &lib().comps {
+                    groups.entry(&part.category).or_default().push(part);
+                }
+                let mut groups: Vec<_> = groups.into_iter().collect();
+                groups.sort_by_key(|(category, _)| match *category {
+                    "lumped components" => 0,
+                    "sources" => 1,
+                    "simulations" => 2,
+                    _ => 3,
                 });
+                for (category, parts) in groups {
+                    let name = crate::palette::category_name(category);
+                    egui::CollapsingHeader::new(format!("{name} ({})", parts.len()))
+                        .id_salt(category)
+                        .default_open(category == "lumped components")
+                        .show(ui, |ui| {
+                            for part in parts {
+                                self.builtin_palette_entry(ui, part);
+                            }
+                        });
+                }
             }
         });
     }
 
     /// Qucs-S component libraries (real parts) with symbol icons.
     fn library_browser(&mut self, ui: &mut egui::Ui) {
-        ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("検索 (lm358, 1n4148, irf…)"));
+        ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("検索（LM358、ダイオード）"));
         let libs = crate::qlib::libraries();
         if libs.is_empty() {
             ui.label("Qucs-S のライブラリが見つかりません（QUCS_S_LIBRARY で指定できます）");
             return;
         }
-        let words: Vec<String> = self.lib_query.to_lowercase().split_whitespace().map(|s| s.to_string()).collect();
+        let query = crate::palette::search_text(self.lib_query.trim());
         egui::ScrollArea::vertical().id_salt("libs").show(ui, |ui| {
+            let mut found = false;
             for l in libs {
                 let items: Vec<&crate::qlib::LibComp> = l
                     .comps
                     .iter()
-                    .filter(|c| {
-                        let hay = format!("{} {} {}", l.name, c.name, c.description).to_lowercase();
-                        words.iter().all(|w| hay.contains(w))
-                    })
+                    .filter(|c| query.is_empty() || crate::palette::library_matches(&l.name, &c.name, &c.description, &query))
                     .collect();
                 if items.is_empty() {
                     continue;
                 }
+                found = true;
                 let title = format!("{} ({}){}", l.name, items.len(), if l.ngspice_ok { "" } else { "  ⚠ngspice非対応" });
-                egui::CollapsingHeader::new(title).id_salt(&l.name).default_open(!words.is_empty() && items.len() <= 30).show(ui, |ui| {
+                egui::CollapsingHeader::new(title).id_salt((&l.name, !query.is_empty())).default_open(!query.is_empty() && items.len() <= 30).show(ui, |ui| {
                     for c in items.iter().take(400) {
                         let key = format!("Lib:{}/{}", l.name, c.name);
-                        let selected = self.tool == Tool::Place(key.clone());
                         let desc: String = c.description.chars().take(60).collect();
-                        if self.palette_row(ui, &key, &c.name, &desc, selected).on_hover_text(&c.description).clicked() {
-                            self.tool = Tool::Place(key);
-                            self.place_rot = 0;
-                        }
+                        self.palette_entry(ui, &key, &c.name, &desc, &c.description);
                     }
                 });
+            }
+            if !found {
+                ui.label("該当するライブラリ部品がありません。");
             }
         });
     }
 
     fn properties(&mut self, ui: &mut egui::Ui) {
+        self.property_editing = false;
         if self.sel.len() != 1 {
             ui.heading("プロパティ");
             if self.sel.is_empty() {
@@ -2337,6 +2512,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("名前");
             let r = ui.text_edit_singleline(&mut self.name_buf);
+            self.property_editing |= r.has_focus();
             if r.lost_focus() && self.name_buf != c.name && !self.name_buf.is_empty() {
                 self.doc.checkpoint();
                 self.doc.sch.components[ci].name = self.name_buf.clone();
@@ -2414,6 +2590,7 @@ impl App {
                                 }
                             } else {
                                 let r = ui.add_sized([w, row_h], egui::TextEdit::singleline(&mut self.prop_buf[k]));
+                                self.property_editing |= r.has_focus();
                                 if r.lost_focus() && self.prop_buf[k] != p.value {
                                     commit = Some((k, self.prop_buf[k].clone()));
                                 }
@@ -2438,146 +2615,6 @@ impl App {
         }
     }
 
-    fn sim_window(&mut self, ctx: &egui::Context) {
-        use crate::diagram::DiagramKind as K;
-        if !self.show_sim {
-            return;
-        }
-        let mut open = true;
-        egui::Window::new("シミュレーション結果").open(&mut open).default_size([940.0, 700.0]).show(ctx, |ui| {
-            let Some(r) = &self.sim else {
-                ui.label("結果なし");
-                return;
-            };
-            if !r.errors.is_empty() {
-                ui.colored_label(ui.visuals().error_fg_color, r.errors.join("\n"));
-            }
-            if r.plots.is_empty() {
-                return;
-            }
-            // sweep steps are grouped under their base analysis
-            let mut entries: Vec<(String, usize)> = Vec::new();
-            for (k, p) in r.plots.iter().enumerate() {
-                if p.sweep.is_some() {
-                    if !entries.iter().any(|e| e.0.starts_with(&format!("{} ", p.base))) {
-                        entries.push((format!("{} ({}, スイープ)", p.base, p.kind), k));
-                    }
-                } else {
-                    entries.push((format!("{} ({})", p.name, p.kind), k));
-                }
-            }
-            let mut changed = false;
-            ui.horizontal(|ui| {
-                let cur = entries.iter().find(|e| e.1 == self.plot_analysis).map(|e| e.0.clone()).unwrap_or_default();
-                egui::ComboBox::from_label("解析").selected_text(cur).show_ui(ui, |ui| {
-                    for (n, k) in &entries {
-                        if ui.selectable_value(&mut self.plot_analysis, *k, n).changed() {
-                            changed = true;
-                            self.markers.clear();
-                        }
-                    }
-                });
-                ui.separator();
-                for (k, label) in [(K::Rect, "直交"), (K::Polar, "極座標"), (K::Smith, "スミス"), (K::Table, "表")] {
-                    if ui.selectable_label(self.diag_kind == k, label).clicked() {
-                        self.diag_kind = k;
-                        changed = true;
-                    }
-                }
-                ui.separator();
-                if ui.button("マーカー消去").clicked() {
-                    self.markers.clear();
-                    changed = true;
-                }
-            });
-            let p = &r.plots[self.plot_analysis.min(r.plots.len() - 1)];
-            ui.horizontal_wrapped(|ui| {
-                for v in p.vectors.iter().skip(if p.kind == "op" { 0 } else { 1 }) {
-                    let mut on = self.plot_vectors.contains(&v.name);
-                    if ui.checkbox(&mut on, &v.name).changed() {
-                        if on {
-                            self.plot_vectors.push(v.name.clone());
-                        } else {
-                            self.plot_vectors.retain(|n| n != &v.name);
-                        }
-                        changed = true;
-                    }
-                }
-            });
-            if changed {
-                self.plot_dirty = true;
-            }
-            if self.plot_dirty || self.plot_tex.is_none() {
-                self.plot_dirty = false;
-                let plots = r.find_all(Some(if p.sweep.is_some() { &p.base } else { &p.name })).unwrap_or_default();
-                let kind = if p.kind == "op" { K::Table } else { self.diag_kind.clone() };
-                let spec = crate::diagram::DiagramSpec {
-                    kind,
-                    vectors: self.plot_vectors.iter().filter(|n| p.vector(n).is_some()).cloned().collect(),
-                    markers: self.markers.clone(),
-                    ..Default::default()
-                };
-                match crate::diagram::diagram_svg(&plots, &spec, 900.0, if spec.kind == K::Rect { 520.0 } else { 640.0 }) {
-                    Ok(out) => {
-                        self.marker_out = out.markers.clone();
-                        self.plot_area = out.plot_area;
-                        if let Ok((w, h, rgba)) = crate::render::svg_to_rgba(&out.svg) {
-                            let img = egui::ColorImage::from_rgba_premultiplied([w as usize, h as usize], &theme::pal(ctx).map_image(&rgba));
-                            self.plot_px = (w as f32, h as f32);
-                            self.plot_tex = Some(ctx.load_texture("plot", img, egui::TextureOptions::LINEAR));
-                        }
-                    }
-                    Err(e) => {
-                        self.status = e;
-                        self.plot_tex = None;
-                        self.plot_area = None;
-                    }
-                }
-            }
-            if let Some(t) = &self.plot_tex {
-                let avail = ui.available_width();
-                let sz = t.size_vec2();
-                let k = (avail / sz.x).min(1.0);
-                let resp = ui.add(egui::Image::new((t.id(), sz * k)).sense(Sense::click()));
-                // click inside the plot area places a marker at that x
-                if let (true, Some(pos), Some((l, _tp, w, _h, x0, x1, log))) = (resp.clicked(), resp.interact_pointer_pos(), self.plot_area) {
-                    let px = ((pos.x - resp.rect.min.x) / k) as f64;
-                    let f = ((px - l) / w).clamp(0.0, 1.0);
-                    let x = if log { (x0.ln() + f * (x1.ln() - x0.ln())).exp() } else { x0 + f * (x1 - x0) };
-                    self.markers.push(x);
-                    self.plot_dirty = true;
-                }
-                if self.plot_area.is_some() {
-                    ui.small("グラフをクリックするとマーカーを追加します");
-                }
-            }
-            if let Some(arr) = self.marker_out.as_array() {
-                if !arr.is_empty() {
-                    egui::Grid::new("markers").striped(true).show(ui, |ui| {
-                        for m in arr {
-                            ui.label(crate::plot::eng(m.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0)));
-                            ui.label(m.get("label").or(m.get("vector")).and_then(|v| v.as_str()).unwrap_or(""));
-                            let v = m.get("value").cloned().unwrap_or_default();
-                            let txt = match &v {
-                                serde_json::Value::Number(n) => crate::plot::eng(n.as_f64().unwrap_or(0.0)),
-                                serde_json::Value::Object(o) => format!(
-                                    "{} dB, {:.1}°",
-                                    o.get("db").and_then(|x| x.as_f64()).map(|x| format!("{x:.2}")).unwrap_or_default(),
-                                    o.get("phase_deg").and_then(|x| x.as_f64()).unwrap_or(0.0)
-                                ),
-                                _ => "-".into(),
-                            };
-                            ui.label(txt);
-                            ui.end_row();
-                        }
-                    });
-                }
-            }
-        });
-        if !open {
-            self.show_sim = false;
-        }
-    }
 
     // ------------------------------------------------------------------ tools
 
@@ -2932,7 +2969,7 @@ impl App {
                 self.doc.sch.components[ci].props[prop].value = v.clone();
                 self.changed();
                 self.status = format!("{comp} = {v}");
-                if self.tools.tune_auto && self.sim_rx.is_none() {
+                if self.tools.tune_auto {
                     self.run_sim();
                 }
             } else {
@@ -2940,6 +2977,82 @@ impl App {
             }
         }
         self.tools.tune_open = open;
+    }
+
+    // ------------------------------------------------------------------ circuit check
+
+    fn refresh_issues(&mut self) {
+        self.issues = check::check(&self.doc.sch, &self.conn).issues;
+        if self.issue_focus.is_some_and(|point| !self.issues.iter().any(|issue| issue.at == point)) {
+            self.issue_focus = None;
+            self.center_on_issue = false;
+        }
+    }
+
+    fn issue_panel(&mut self, ctx: &egui::Context) {
+        if !self.show_issue_panel {
+            return;
+        }
+        let mut focus = None;
+        let mut junction = None;
+        egui::TopBottomPanel::bottom("issues").resizable(true).default_height(150.0).show(ctx, |ui| {
+            let errors = self.issues.iter().filter(|issue| issue.severity == "error").count();
+            let warnings = self.issues.len() - errors;
+            ui.horizontal(|ui| {
+                ui.heading("回路チェック");
+                ui.label(format!("エラー {errors} / 警告 {warnings}"));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("閉じる").clicked() {
+                        self.show_issue_panel = false;
+                    }
+                });
+            });
+            if self.doc.sch.components.is_empty() && self.doc.sch.wires.is_empty() {
+                ui.label("部品と配線を配置するとチェックできます。");
+                return;
+            }
+            if self.issues.is_empty() {
+                ui.label("チェック完了。問題は見つかりませんでした。");
+                return;
+            }
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for (index, issue) in self.issues.iter().enumerate() {
+                    let (severity, color) = if issue.severity == "error" { ("エラー", self.pal().error) } else { ("警告", self.pal().warn) };
+                    ui.push_id(index, |ui| {
+                        ui.separator();
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.selectable_label(self.issue_focus == Some(issue.at), "場所を表示").clicked() {
+                                focus = Some(issue.at);
+                            }
+                            ui.colored_label(color, severity);
+                            ui.label(&issue.summary_ja);
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(issue.guidance_ja());
+                            if let Some(point) = issue.junction_point(&self.doc.sch) {
+                                if ui.small_button("接続点を作成").on_hover_text("配線を分割し、この位置にあるピンや配線端を接続します").clicked() {
+                                    junction = Some(point);
+                                }
+                            }
+                        });
+                    });
+                }
+            });
+        });
+        if let Some(point) = focus {
+            self.issue_focus = Some(point);
+            self.center_on_issue = true;
+        }
+        if let Some(point) = junction {
+            self.doc.checkpoint();
+            self.doc.sch.wires = crate::doc::split_wires_at(std::mem::take(&mut self.doc.sch.wires), point);
+            self.sel_wires.clear();
+            self.status = format!("接続点（{}, {}）を作成しました", point.0, point.1);
+            self.changed();
+        }
+        if !self.show_issue_panel {
+            self.issue_focus = None;
+        }
     }
 
     // ------------------------------------------------------------------ canvas
@@ -2953,6 +3066,13 @@ impl App {
         if self.need_fit {
             self.fit(canvas);
             self.need_fit = false;
+        }
+        if self.center_on_issue {
+            if let Some((x, y)) = self.issue_focus {
+                self.zoom = self.zoom.max(1.0);
+                self.offset = Vec2::new(x as f32, y as f32) - canvas.size() / 2.0 / self.zoom;
+            }
+            self.center_on_issue = false;
         }
         let ctx = ui.ctx().clone();
         let hover = resp.hover_pos();
@@ -2981,6 +3101,11 @@ impl App {
         self.paint_shapes(&painter, canvas, &shapes, 1.0);
         self.scene.shapes = shapes;
         self.paint_op(&painter, canvas);
+        if let Some((x, y)) = self.issue_focus {
+            let point = self.to_screen(canvas, x, y);
+            painter.circle_stroke(point, 13.0, Stroke::new(3.0_f32, self.pal().canvas));
+            painter.circle_stroke(point, 13.0, Stroke::new(1.8_f32, self.pal().accent_hi));
+        }
 
         let pointer = hover.map(|h| self.to_sch_f(canvas, h));
         match self.tool.clone() {
@@ -3444,7 +3569,15 @@ impl App {
     }
 
     fn keys(&mut self, ctx: &egui::Context, canvas: Rect) {
-        if ctx.wants_keyboard_input() {
+        if self.external_review.is_some() {
+            return;
+        }
+        let wants_keyboard = ctx.wants_keyboard_input();
+        if (!wants_keyboard || self.property_editing) && ctx.input(|i| i.key_pressed(egui::Key::F5)) {
+            self.run_sim();
+            return;
+        }
+        if wants_keyboard {
             return;
         }
         let (ctrl, keys) = ctx.input(|i| (i.modifiers.command, i.keys_down.clone()));
@@ -3528,10 +3661,6 @@ impl App {
             self.fit(canvas);
             return;
         }
-        if pressed(egui::Key::F5) {
-            self.run_sim();
-            return;
-        }
         if pressed(egui::Key::F1) {
             self.about_open = true;
             return;
@@ -3590,37 +3719,11 @@ impl eframe::App for App {
         self.poll_disk();
         self.poll_open_requests();
         self.heartbeat();
-        if let Some((tid, rx)) = &self.sim_rx {
-            if let Ok(r) = rx.try_recv() {
-                let tid = *tid;
-                self.sim_rx = None;
-                if tid != self.tab_id {
-                    // finished for a tab that is not shown: keep it there
-                    if let Some(t) = self.tabs.iter_mut().flatten().find(|t| t.tab_id == tid) {
-                        if let Ok(res) = r {
-                            t.sim = Some(res);
-                            t.show_sim = true;
-                        }
-                    }
-                    return;
-                }
-                match r {
-                    Ok(res) => {
-                        self.status = format!("シミュレーション完了 ({:.2} s): {}", res.elapsed, res.plots.iter().map(|p| p.name.clone()).collect::<Vec<_>>().join(", "));
-                        self.plot_vectors = res.plots.first().map(|p| p.vectors.iter().skip(1).filter(|v| v.name.starts_with("v(")).take(4).map(|v| v.name.clone()).collect()).unwrap_or_default();
-                        self.sim = Some(res);
-                        self.plot_analysis = 0;
-                        self.plot_dirty = true;
-                        self.show_sim = true;
-                    }
-                    Err(e) => self.status = format!("シミュレーション失敗: {e}"),
-                }
-            }
-        }
+        self.poll_simulation();
         let title = format!(
             "Qucs-S RS — {}{}",
             self.doc.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "無題".into()),
-            if self.unsaved(&self.doc) { " *" } else { "" }
+            if self.tab_unsaved(self.active) { " *" } else { "" }
         );
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
 
@@ -3628,33 +3731,41 @@ impl eframe::App for App {
         if th != self.tex_theme {
             self.tex_theme = th;
             self.gen += 1;
-            self.plot_dirty = true;
+            self.simulation.invalidate_chart();
             self.mc_textures(ctx);
         }
 
         let screen = ctx.content_rect();
         let pal = self.pal();
         let bar = egui::Frame::new().fill(pal.bar).inner_margin(egui::Margin::symmetric(10, 6)).stroke(egui::Stroke::new(1.0_f32, pal.border));
-        egui::TopBottomPanel::top("toolbar").frame(bar).show(ctx, |ui| self.toolbar(ui, screen));
+        egui::TopBottomPanel::top("toolbar").frame(bar).show(ctx, |ui| self.toolbar(ui));
         egui::TopBottomPanel::top("tabs").frame(egui::Frame::new().fill(pal.bar).inner_margin(egui::Margin::symmetric(10, 3))).show(ctx, |ui| self.tab_bar(ui));
+        self.simulation_notice(ctx);
         egui::TopBottomPanel::bottom("status").frame(bar.inner_margin(egui::Margin::symmetric(10, 3))).show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if self.sim_rx.is_some() || self.mc.rx.is_some() {
+                if self.simulation_running() || self.mc.rx.is_some() {
                     ui.spinner();
                 }
                 ui.label(&self.status);
-                if self.sim.is_some() && ui.small_button("結果").clicked() {
-                    self.show_sim = true;
-                }
+                self.simulation_status_button(ui);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("ⓘ").on_hover_text("バージョン情報 (F1)").clicked() {
                         self.about_open = true;
                     }
                     self.theme_menu(ui);
-                    let errs = self.issues.iter().filter(|i| i.severity == "error").count();
-                    let warns = self.issues.len() - errs;
-                    if ui.small_button(format!("⚠ エラー {errs} / 警告 {warns}")).clicked() {
+                    let check_label = if self.show_issues || self.show_issue_panel {
+                        let errors = self.issues.iter().filter(|issue| issue.severity == "error").count();
+                        format!("エラー {errors} / 警告 {}", self.issues.len() - errors)
+                    } else {
+                        "回路チェック".into()
+                    };
+                    if ui.small_button(check_label).clicked() {
                         self.show_issue_panel = !self.show_issue_panel;
+                        if self.show_issue_panel {
+                            self.refresh_issues();
+                        } else {
+                            self.issue_focus = None;
+                        }
                     }
                     ui.label(format!("部品 {}  配線 {}  ネット {}", self.doc.sch.components.len(), self.doc.sch.wires.len(), self.conn.nets.len()));
                 });
@@ -3662,36 +3773,23 @@ impl eframe::App for App {
         });
         if self.external_change {
             egui::TopBottomPanel::top("ext").show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.colored_label(self.pal().warn, "ファイルが外部（AIエージェント）で変更されました。");
-                    if ui.button("再読み込み").clicked() {
-                        self.reload_from_disk();
-                    }
-                    if ui.button("無視").clicked() {
-                        self.external_change = false;
-                        self.disk_mtime = self.doc.path.as_ref().and_then(mtime);
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(self.pal().warn, "外部との変更が競合しています。元のファイルへの保存を保留しています。");
+                    if ui.button("変更を確認…").clicked() {
+                        self.external_review = self.doc.path.as_deref().map(Doc::open);
                     }
                 });
             });
         }
-        if self.show_issue_panel {
-            egui::TopBottomPanel::bottom("issues").resizable(true).default_height(140.0).show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let mut goto = None;
-                    for (k, i) in self.issues.iter().enumerate() {
-                        let c = if i.severity == "error" { self.pal().error } else { self.pal().warn };
-                        if ui.add(egui::Label::new(egui::RichText::new(format!("{}. [{}] {}", k + 1, i.kind, i.message)).color(c)).sense(Sense::click())).clicked() {
-                            goto = Some(i.at);
-                        }
-                    }
-                    if let Some((x, y)) = goto {
-                        let c = screen.center();
-                        self.offset = Vec2::new(x as f32, y as f32) - (c - screen.min) / self.zoom;
-                    }
-                });
-            });
+        self.issue_panel(ctx);
+        let simulation_panel_visible = self.simulation_panel(ctx);
+        if self.simulation_panel_visible != simulation_panel_visible {
+            self.simulation_panel_visible = simulation_panel_visible;
+            self.need_fit = true;
         }
-        let lw = egui::SidePanel::left("palette").default_width(self.settings.left_panel).show(ctx, |ui| self.palette(ui)).response.rect.width();
+        let palette_max_width = (screen.width() * 0.42).max(120.0);
+        let lw = egui::SidePanel::left("palette").default_width(self.settings.left_panel).width_range(120.0..=palette_max_width)
+            .show(ctx, |ui| self.palette(ui)).response.rect.width();
         let rw = egui::SidePanel::right("props").default_width(self.settings.right_panel).show(ctx, |ui| self.properties(ui)).response.rect.width();
         self.settings.left_panel = lw;
         self.settings.right_panel = rw;
@@ -3700,7 +3798,7 @@ impl eframe::App for App {
             self.keys(ctx, canvas);
             self.canvas(ui);
         });
-        self.sim_window(ctx);
+        self.simulation_window(ctx);
         self.tool_windows(ctx);
         self.mc_window(ctx);
         self.op_window(ctx);
@@ -3708,6 +3806,7 @@ impl eframe::App for App {
         self.about_window(ctx);
         self.subckt_dialog(ctx);
         self.confirm_dialog(ctx);
+        self.external_change_dialog(ctx);
         if let Some((pos, mut text, editing)) = self.text_prompt.take() {
             let mut done = false;
             let mut cancel = false;
@@ -3767,6 +3866,7 @@ impl eframe::App for App {
                 self.label_prompt = Some((t, text));
             }
         }
+        self.start_requested_simulation(ctx);
         self.drive_shot(ctx);
         // keep polling the file even when idle
         ctx.request_repaint_after(std::time::Duration::from_millis(350));

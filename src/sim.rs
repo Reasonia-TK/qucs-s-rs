@@ -601,6 +601,16 @@ pub fn simulate(sch_path: &Path, timeout_s: u64) -> Result<SimResult, String> {
     let sch_path = canonical(sch_path)?;
     let (workdir, stem) = work_dir(&sch_path, "sim")?;
     std::fs::create_dir_all(&workdir).map_err(|e| e.to_string())?;
+    // GUI snapshots and the CLI/MCP share the project's simulation outputs. Hold
+    // the workspace lock until all output files have been read into the result.
+    let workspace_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(workdir.join(".qucs-rs.lock"))
+        .map_err(|e| format!("cannot open simulation workspace lock: {e}"))?;
+    workspace_lock.lock().map_err(|e| format!("cannot lock simulation workspace: {e}"))?;
     let net_path = workdir.join(format!("{stem}.cir"));
     let net = netlist(&sch_path, &net_path)?;
     run_netlist(&net, &workdir, &net_path, timeout_s)

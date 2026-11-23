@@ -17,6 +17,7 @@ pub struct Settings {
     pub auto_reroute: bool,
     /// most recent first
     pub recent: Vec<String>,
+    pub part_favorites: Vec<String>,
     pub left_panel: f32,
     pub right_panel: f32,
 }
@@ -31,6 +32,7 @@ impl Default for Settings {
             auto_save: false,
             auto_reroute: true,
             recent: vec![],
+            part_favorites: crate::palette::DEFAULT_FAVORITES.iter().map(|part| (*part).to_string()).collect(),
             left_panel: 230.0,
             right_panel: 290.0,
         }
@@ -117,6 +119,7 @@ mod tests {
         assert!(!s.show_grid);
         assert!(!s.auto_save);
         assert_eq!(s.left_panel, 230.0);
+        assert_eq!(s.part_favorites, crate::palette::DEFAULT_FAVORITES);
     }
 
     #[test]
@@ -131,6 +134,7 @@ mod tests {
         std::env::set_var("QUCS_RS_SETTINGS", &p);
         let mut s = Settings::default();
         s.color_nets = true;
+        s.part_favorites = vec!["Lib:OpAmps/LM358".into()];
         s.add_recent(Path::new("C:/a.sch"));
         s.save();
         assert_eq!(Settings::load(), s);

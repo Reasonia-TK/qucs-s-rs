@@ -39,6 +39,8 @@ pub struct DiagramSpec {
     /// Rect: y range of the main panel; Polar: (_, max radius)
     pub y_range: Option<(f64, f64)>,
     pub title: Option<String>,
+    /// Cartesian comparisons append previous-run plots starting at this index.
+    pub previous_start: Option<usize>,
     /// Smith reference impedance, default 50
     pub z0: f64,
 }
@@ -56,6 +58,7 @@ impl Default for DiagramSpec {
             x_range: None,
             y_range: None,
             title: None,
+            previous_start: None,
             z0: 50.0,
         }
     }
@@ -90,8 +93,11 @@ const C_FRAME: &str = "#8a9099";
 const C_GRID: &str = "#e1e4e8";
 const C_GRID_MINOR: &str = "#f0f2f4";
 const C_TEXT: &str = "#333";
-const C_TICK: &str = "#555";
+const C_TICK: &str = "#404040";
 const C_MARKER: &str = "#444";
+const LEGEND_FONT: f64 = 13.0;
+const LEGEND_LABEL_X: f64 = 36.0;
+const LEGEND_ROW: f64 = 18.0;
 
 // ---------------------------------------------------------------- helpers
 
@@ -253,6 +259,28 @@ struct Trace<'a> {
     x: &'a [f64],
     v: &'a Vector,
     step: Value,
+    style: TraceStyle,
+}
+
+#[derive(Clone, Copy)]
+struct TraceStyle {
+    index: usize,
+    previous: bool,
+}
+
+impl TraceStyle {
+    fn dash(self) -> &'static str {
+        const DASHES: [&str; 6] = ["none", "11 4", "2 4", "10 4 2 4", "16 5", "4 3 11 3"];
+        if self.previous { "5 5" } else { DASHES[self.index % DASHES.len()] }
+    }
+
+    fn width(self) -> f64 {
+        if self.previous { 3.2 } else { 1.9 }
+    }
+
+    fn opacity(self) -> f64 {
+        if self.previous { 0.6 } else { 1.0 }
+    }
 }
 
 fn available(p: &Plot) -> String {
@@ -285,13 +313,17 @@ fn collect_traces<'a>(plots: &[&'a Plot], spec: &DiagramSpec) -> Result<Vec<Trac
         });
     }
     let mut out = Vec::new();
-    for p in plots {
+    let comparing = spec.previous_start.is_some();
+    for (pi, p) in plots.iter().enumerate() {
+        let previous_start = spec.previous_start.filter(|&start| pi >= start);
+        let previous = previous_start.is_some();
+        let matching = previous_start.and_then(|start| plots[..start].iter().position(|current| current.sweep == p.sweep));
         let x: &[f64] = match p.scale() {
             Some(s) => &s.re,
             None => &[],
         };
         let sl = sweep_label(p);
-        for n in &names {
+        for (signal, n) in names.iter().enumerate() {
             let v = p.vector(n).ok_or_else(|| format!("no vector '{n}' in analysis '{}'. Available vectors: {}", p.name, available(p)))?;
             if matches!(spec.kind, DiagramKind::Polar | DiagramKind::Smith) && !v.is_complex() {
                 let cx: Vec<String> = p.vectors.iter().filter(|v| v.is_complex()).map(|v| v.name.clone()).collect();
@@ -302,13 +334,15 @@ fn collect_traces<'a>(plots: &[&'a Plot], spec: &DiagramSpec) -> Result<Vec<Trac
                     if cx.is_empty() { "none".to_string() } else { cx.join(", ") }
                 ));
             }
-            let k = out.len();
+            let label = if sl.is_empty() { v.name.clone() } else { format!("{} {sl}", v.name) };
+            let k = matching.map_or(out.len(), |step| step * names.len() + signal);
             out.push(Trace {
-                label: if sl.is_empty() { v.name.clone() } else { format!("{} {sl}", v.name) },
+                label: if previous { format!("{label} (previous)") } else if comparing { format!("{label} (current)") } else { label },
                 color: NET_PALETTE[k % NET_PALETTE.len()].hex(),
                 x,
                 v,
                 step: p.sweep.clone().unwrap_or(Value::Null),
+                style: TraceStyle { index: k, previous },
             });
         }
     }
@@ -334,41 +368,67 @@ fn svg_open(s: &mut String, w: f64, h: f64, title: &str) {
     }
 }
 
+struct LegendItem {
+    x: f64,
+    y: f64,
+    label: String,
+    color: String,
+    style: TraceStyle,
+}
+
 /// Flow layout of legend entries; returns (rows height, items with positions).
-fn legend_layout(labels: &[(String, String)], x0: f64, width: f64) -> (f64, Vec<(f64, f64, String, String)>) {
-    // many traces (Monte Carlo, long sweeps): one summary entry instead of a wall of labels
-    if labels.len() > 16 {
-        let first = labels[0].0.split_whitespace().next().unwrap_or("").to_string();
-        let summary = vec![(format!("{first} … {} traces", labels.len()), labels[0].1.clone())];
-        return legend_layout(&summary, x0, width);
-    }
+fn legend_layout(traces: &[Trace], x0: f64, width: f64) -> (f64, Vec<LegendItem>) {
+    let labels: Vec<_> = if traces.len() > 16 {
+        // Summarize long sweeps while retaining the distinction between runs.
+        let compare = traces.iter().any(|t| t.style.previous);
+        [false, true].iter().filter_map(|&previous| {
+            let mut group = traces.iter().filter(|t| t.style.previous == previous);
+            let first = group.next()?;
+            let count = group.count() + 1;
+            let name = first.v.name.as_str();
+            let run = if previous { " (previous)" } else if compare { " (current)" } else { "" };
+            Some((format!("{name} … {count} traces{run}"), first))
+        }).collect()
+    } else {
+        traces.iter().map(|trace| (trace.label.clone(), trace)).collect()
+    };
     let mut items = Vec::new();
     let (mut x, mut row) = (x0, 0usize);
-    for (lab, col) in labels {
-        let iw = 24.0 + tw(lab, 11.0) + 16.0;
+    for (label, trace) in labels {
+        let iw = LEGEND_LABEL_X + tw(&label, LEGEND_FONT) + 16.0;
         if x > x0 && x + iw > x0 + width {
             x = x0;
             row += 1;
         }
-        items.push((x, row as f64 * 16.0, lab.clone(), col.clone()));
+        items.push(LegendItem { x, y: row as f64 * LEGEND_ROW, label, color: trace.color.clone(), style: trace.style });
         x += iw;
     }
-    let h = if labels.is_empty() { 0.0 } else { (row + 1) as f64 * 16.0 };
+    let h = if items.is_empty() { 0.0 } else { (row + 1) as f64 * LEGEND_ROW };
     (h, items)
 }
 
-fn draw_legend(s: &mut String, items: &[(f64, f64, String, String)], top: f64) {
-    for (x, dy, lab, col) in items {
-        let y = top + dy + 8.0;
+fn draw_legend(s: &mut String, items: &[LegendItem], top: f64) {
+    for item in items {
+        let (x, y) = (item.x, top + item.y + 8.0);
+        let (color, style) = (&item.color, item.style);
         let _ = write!(
             s,
-            r##"<line x1="{x:.1}" y1="{y:.1}" x2="{:.1}" y2="{y:.1}" stroke="{col}" stroke-width="2.5"/><text x="{:.1}" y="{:.1}" font-size="11" fill="#222">{}</text>"##,
-            x + 18.0,
-            x + 24.0,
+            r##"<line x1="{x:.1}" y1="{y:.1}" x2="{:.1}" y2="{y:.1}" stroke="{color}" stroke-width="{}" stroke-dasharray="{}" stroke-opacity="{}"/><text x="{:.1}" y="{:.1}" font-size="{LEGEND_FONT}" fill="#222">{}</text>"##,
+            x + 30.0,
+            style.width(),
+            style.dash(),
+            style.opacity(),
+            x + LEGEND_LABEL_X,
             y + 4.0,
-            esc(lab)
+            esc(&item.label)
         );
     }
+}
+
+fn draw_trace(s: &mut String, tr: &Trace, points: &str) {
+    let style = tr.style;
+    let _ = write!(s, r##"<polyline points="{points}" fill="none" stroke="{}" stroke-width="{}" stroke-dasharray="{}" stroke-opacity="{}" stroke-linejoin="round"/>"##,
+        tr.color, style.width(), style.dash(), style.opacity());
 }
 
 /// A value box (one or more lines) drawn with a coloured border.
@@ -562,8 +622,18 @@ fn y_label_for(traces: &[Trace], use_db: bool) -> String {
         n.dedup();
         n
     };
-    let what = if names.len() == 1 { names[0].to_string() } else { "magnitude".to_string() };
     let cx = traces.iter().any(|t| t.v.is_complex());
+    let what = if names.len() == 1 {
+        names[0].to_string()
+    } else if cx {
+        "magnitude".into()
+    } else {
+        match units.as_slice() {
+            ["V"] => "voltage",
+            ["A"] => "current",
+            _ => "value",
+        }.into()
+    };
     if use_db {
         format!("{} [dB]", if names.len() == 1 { format!("dB({})", names[0]) } else { "magnitude".into() })
     } else if units.len() == 1 {
@@ -662,8 +732,7 @@ fn rect(plots: &[&Plot], spec: &DiagramSpec, traces: &[Trace], w: f64, h: f64) -
     let title = spec.title.clone().unwrap_or_else(|| default_title(p0));
     let (ml, mr) = (74.0, 22.0);
     let pw = (w - ml - mr).max(50.0);
-    let labels: Vec<(String, String)> = traces.iter().map(|t| (t.label.clone(), t.color.clone())).collect();
-    let (leg_h, leg_items) = legend_layout(&labels, ml, pw);
+    let (leg_h, leg_items) = legend_layout(traces, ml, pw);
     let top0 = if title.is_empty() { 14.0 } else { 36.0 } + if spec.markers.is_empty() { 0.0 } else { 16.0 };
     let bottom = 20.0 + 22.0 + if leg_h > 0.0 { leg_h + 8.0 } else { 0.0 } + 4.0;
     let gap = 20.0;
@@ -735,7 +804,7 @@ fn rect(plots: &[&Plot], spec: &DiagramSpec, traces: &[Trace], w: f64, h: f64) -
             let _ = write!(s, r##"<line x1="{ml}" y1="{y:.1}" x2="{:.1}" y2="{y:.1}" stroke="{}"/>"##, ml + pw, if major { C_GRID } else { C_GRID_MINOR });
             if lab {
                 let txt = if pd.phase { format!("{t:.0}") } else { eng(t) };
-                let _ = write!(s, r##"<text x="{:.1}" y="{:.1}" font-size="11" fill="{C_TICK}" text-anchor="end">{}</text>"##, ml - 6.0, y + 4.0, esc(&txt));
+                let _ = write!(s, r##"<text x="{:.1}" y="{:.1}" font-size="13" fill="{C_TICK}" text-anchor="end">{}</text>"##, ml - 6.0, y + 4.0, esc(&txt));
             }
         }
         let last = pi == panels.len() - 1;
@@ -743,15 +812,23 @@ fn rect(plots: &[&Plot], spec: &DiagramSpec, traces: &[Trace], w: f64, h: f64) -
             let x = xa.px(t);
             let _ = write!(s, r##"<line x1="{x:.1}" y1="{top:.1}" x2="{x:.1}" y2="{:.1}" stroke="{}"/>"##, top + ph, if major { C_GRID } else { C_GRID_MINOR });
             if lab && last {
-                let _ = write!(s, r##"<text x="{x:.1}" y="{:.1}" font-size="11" fill="{C_TICK}" text-anchor="middle">{}</text>"##, top + ph + 15.0, eng(t));
+                let _ = write!(s, r##"<text x="{x:.1}" y="{:.1}" font-size="13" fill="{C_TICK}" text-anchor="middle">{}</text>"##, top + ph + 17.0, eng(t));
             }
         }
         let _ = write!(s, r##"<rect x="{ml}" y="{top:.1}" width="{pw:.1}" height="{ph:.1}" fill="none" stroke="{C_FRAME}"/>"##);
-        let cy = top + ph / 2.0;
-        let _ = write!(s, r##"<text x="16" y="{cy:.1}" font-size="12" fill="{C_TEXT}" text-anchor="middle" transform="rotate(-90 16 {cy:.1})">{}</text>"##, esc(&pd.ylabel));
+        let ylabel = esc(&pd.ylabel);
+        if ph >= tw(&pd.ylabel, 14.0) + 8.0 {
+            let cy = top + ph / 2.0;
+            let _ = write!(s, r##"<text x="16" y="{cy:.1}" font-size="14" fill="{C_TEXT}" text-anchor="middle" transform="rotate(-90 16 {cy:.1})">{ylabel}</text>"##);
+        } else {
+            let _ = write!(s, r##"<text x="{ml:.1}" y="{:.1}" font-size="13" fill="{C_TEXT}">{ylabel}</text>"##, top - 4.0);
+        }
         // traces
         let _ = write!(s, r##"<clipPath id="clip{pi}"><rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}"/></clipPath><g clip-path="url(#clip{pi})">"##, ml - 2.0, top - 2.0, pw + 4.0, ph + 4.0);
-        for (k, ys) in pd.ys.iter().enumerate() {
+        // Draw the previous run underneath, so even exactly coincident traces can be seen.
+        let split = traces.iter().position(|tr| tr.style.previous).unwrap_or(traces.len());
+        for k in (split..traces.len()).chain(0..split) {
+            let ys = &pd.ys[k];
             if ys.is_empty() {
                 continue;
             }
@@ -771,7 +848,7 @@ fn rect(plots: &[&Plot], spec: &DiagramSpec, traces: &[Trace], w: f64, h: f64) -
                 let _ = write!(segs.last_mut().unwrap(), "{px:.1},{py:.1} ");
             }
             for pts in segs.iter().filter(|p| !p.is_empty()) {
-                let _ = write!(s, r##"<polyline points="{pts}" fill="none" stroke="{}" stroke-width="1.8" stroke-linejoin="round"/>"##, tr.color);
+                draw_trace(&mut s, tr, pts);
             }
         }
         s.push_str("</g>");
@@ -782,7 +859,7 @@ fn rect(plots: &[&Plot], spec: &DiagramSpec, traces: &[Trace], w: f64, h: f64) -
     let (xa0, _) = axes[0];
     let _ = write!(
         s,
-        r##"<text x="{:.1}" y="{:.1}" font-size="12" fill="{C_TEXT}" text-anchor="middle">{}</text>"##,
+        r##"<text x="{:.1}" y="{:.1}" font-size="14" fill="{C_TEXT}" text-anchor="middle">{}</text>"##,
         ml + pw / 2.0,
         plot_bottom + 34.0,
         esc(&if scale.unit.is_empty() { scale.name.clone() } else { format!("{} [{}]", scale.name, scale.unit) })
@@ -800,7 +877,11 @@ fn rect(plots: &[&Plot], spec: &DiagramSpec, traces: &[Trace], w: f64, h: f64) -
                 Some((re, _)) => json!(re),
                 None => Value::Null,
             };
-            marker_json.push(json!({"x": mx, "vector": t.v.name, "label": t.label, "value": value, "step": t.step}));
+            let mut mark = json!({"x": mx, "vector": t.v.name, "label": t.label, "value": value, "step": t.step});
+            if spec.previous_start.is_some() {
+                mark["run"] = json!(if t.style.previous { "previous" } else { "current" });
+            }
+            marker_json.push(mark);
         }
         if !inside {
             continue;
@@ -891,12 +972,11 @@ struct Round {
     r: f64,
     legend_top: f64,
     h: f64,
-    items: Vec<(f64, f64, String, String)>,
+    items: Vec<LegendItem>,
 }
 
 fn round_layout(traces: &[Trace], title: &str, w: f64, h: f64, label_pad: f64) -> Round {
-    let labels: Vec<(String, String)> = traces.iter().map(|t| (t.label.clone(), t.color.clone())).collect();
-    let (leg_h, items) = legend_layout(&labels, 20.0, w - 40.0);
+    let (leg_h, mut items) = legend_layout(traces, 20.0, w - 40.0);
     let top = if title.is_empty() { 10.0 } else { 34.0 };
     let bottom = leg_h + 14.0;
     let avail_h = (h - top - bottom - 2.0 * label_pad).max(80.0);
@@ -904,14 +984,14 @@ fn round_layout(traces: &[Trace], title: &str, w: f64, h: f64, label_pad: f64) -
     let cy = top + label_pad + r;
     let h = cy + r + label_pad + bottom;
     // centre legend
-    let row_w = |row: f64| {
-        let mut e = 20.0f64;
-        for it in items.iter().filter(|i| i.1 == row) {
-            e = e.max(it.0 + 24.0 + tw(&it.2, 11.0));
+    for row in items.chunk_by_mut(|a, b| a.y == b.y) {
+        let end = row.last().unwrap();
+        let row_right = end.x + LEGEND_LABEL_X + tw(&end.label, LEGEND_FONT);
+        let shift = ((w - 20.0 - row_right) / 2.0).max(0.0);
+        for item in row {
+            item.x += shift;
         }
-        e - 20.0
-    };
-    let items = items.iter().map(|(x, y, l, c)| (x + (w - 40.0 - row_w(*y)).max(0.0) / 2.0, *y, l.clone(), c.clone())).collect();
+    }
     Round { cx: w / 2.0, cy, r, legend_top: cy + r + label_pad + 4.0, h, items }
 }
 
@@ -937,7 +1017,7 @@ fn complex_polyline(s: &mut String, tr: &Trace, sc: f64, cx: f64, cy: f64, x_ran
         }
         let _ = write!(pts, "{:.1},{:.1} ", cx + re * sc, cy - imv * sc);
     }
-    let _ = write!(s, r##"<polyline points="{pts}" fill="none" stroke="{}" stroke-width="1.8" stroke-linejoin="round"/>"##, tr.color);
+    draw_trace(s, tr, &pts);
     // start marker (small square) to show direction
     if n > 0 {
         let (re, imv) = (tr.v.re[0], im.map(|v| v[0]).unwrap_or(0.0));
@@ -1240,6 +1320,9 @@ fn table(plots: &[&Plot], spec: &DiagramSpec, traces: &[Trace], w: f64) -> Resul
 /// Table diagrams size their height to the content; `DiagramOut` reports the final size.
 pub fn diagram_svg(plots: &[&Plot], spec: &DiagramSpec, width: f64, height: f64) -> Result<DiagramOut, String> {
     let p0 = *plots.first().ok_or("no simulation data")?;
+    if spec.previous_start.is_some_and(|start| spec.kind != DiagramKind::Rect || start == 0 || start >= plots.len()) {
+        return Err("a comparison needs current and previous plots in a rectangular diagram".into());
+    }
     let (width, height) = (width.max(240.0), height.max(200.0));
     if p0.kind == "op" && spec.kind != DiagramKind::Table {
         return Err(format!("'{}' is an operating point (single values); only a Table diagram can show it", p0.name));
@@ -1357,6 +1440,28 @@ mod tests {
         let pa = out.plot_area.unwrap();
         assert!(pa.6 && (pa.4 - 10.0).abs() < 1e-9 && (pa.5 - 1e6).abs() < 1e-3);
         assert!(out.svg.contains("phase [deg]"));
+    }
+
+    #[test]
+    fn comparison_overlays_the_same_signal_on_one_scale() {
+        let current = rc_ac(2e3, None);
+        let previous = rc_ac(1e3, None);
+        let plots = [&current, &previous];
+        let spec = DiagramSpec {
+            vectors: vec!["v(out)".into()],
+            markers: vec![1000.0],
+            previous_start: Some(1),
+            ..Default::default()
+        };
+        let traces = collect_traces(&plots, &spec).unwrap();
+        assert_eq!(traces[0].color, traces[1].color);
+        assert_ne!(traces[0].style.dash(), traces[1].style.dash());
+        let output = diagram_svg(&plots, &spec, 560.0, 440.0).unwrap();
+        parses(&output.svg);
+        assert!(output.svg.contains("v(out) (previous)"));
+        assert_eq!(output.markers[0]["run"], "current");
+        assert_eq!(output.markers[1]["run"], "previous");
+        assert_ne!(output.markers[0]["value"], output.markers[1]["value"]);
     }
 
     #[test]
