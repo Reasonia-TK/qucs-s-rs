@@ -46,12 +46,9 @@ pub fn run(path: Option<PathBuf>) {
         }
     }
     detach_own_console();
-    let st = crate::settings::Settings::load();
-    let mut vp = egui::ViewportBuilder::default().with_title("Qucs-S RS").with_icon(std::sync::Arc::new(app_icon())).with_maximized(st.maximized);
-    match st.window {
-        Some([x, y, w, h]) if w >= 400.0 && h >= 300.0 => vp = vp.with_inner_size([w, h]).with_position([x.max(0.0), y.max(0.0)]),
-        _ => vp = vp.with_inner_size([1280.0, 780.0]),
-    }
+    // the window geometry is not remembered: a saved position can point at a
+    // monitor that is gone (multi-display setups), leaving the window off screen
+    let vp = egui::ViewportBuilder::default().with_title("Qucs-S RS").with_icon(std::sync::Arc::new(app_icon())).with_inner_size([1280.0, 780.0]).with_maximized(true);
     let opts = eframe::NativeOptions { viewport: vp, ..Default::default() };
     let _ = eframe::run_native("qucs-s-rs", opts, Box::new(move |cc| Ok(Box::new(App::new(cc, path)))));
 }
@@ -3452,18 +3449,6 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm = Some(Confirm::Quit);
         }
-        // remember the window geometry for the next start
-        ctx.input(|i| {
-            let vp = i.viewport();
-            if let Some(m) = vp.maximized {
-                self.settings.maximized = m;
-            }
-            if !self.settings.maximized {
-                if let (Some(o), Some(r)) = (vp.outer_rect, vp.inner_rect) {
-                    self.settings.window = Some([o.min.x, o.min.y, r.width(), r.height()]);
-                }
-            }
-        });
         self.poll_op();
         self.poll_disk();
         self.poll_open_requests();

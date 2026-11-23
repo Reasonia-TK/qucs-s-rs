@@ -17,9 +17,6 @@ pub struct Settings {
     pub auto_reroute: bool,
     /// most recent first
     pub recent: Vec<String>,
-    /// last window position and size [x, y, w, h] (logical points)
-    pub window: Option<[f32; 4]>,
-    pub maximized: bool,
     pub left_panel: f32,
     pub right_panel: f32,
 }
@@ -34,8 +31,6 @@ impl Default for Settings {
             auto_save: true,
             auto_reroute: true,
             recent: vec![],
-            window: None,
-            maximized: true,
             left_panel: 230.0,
             right_panel: 290.0,
         }
@@ -125,13 +120,18 @@ mod tests {
     }
 
     #[test]
+    fn old_window_geometry_is_ignored() {
+        let s: Settings = serde_json::from_str(r#"{"window": [-1900.0, 40.0, 800.0, 600.0], "maximized": false, "show_grid": false}"#).unwrap();
+        assert!(!s.show_grid);
+    }
+
+    #[test]
     fn save_and_load_round_trip() {
         let p = std::env::temp_dir().join(format!("qucs-rs-settings-{}.json", std::process::id()));
         std::env::set_var("QUCS_RS_SETTINGS", &p);
         let mut s = Settings::default();
         s.color_nets = true;
         s.add_recent(Path::new("C:/a.sch"));
-        s.window = Some([10.0, 20.0, 800.0, 600.0]);
         s.save();
         assert_eq!(Settings::load(), s);
         let _ = std::fs::remove_file(&p);
