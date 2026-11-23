@@ -2281,44 +2281,61 @@ impl App {
         let mut commit: Option<(usize, String)> = None;
         let mut toggle: Option<usize> = None;
         egui::ScrollArea::vertical().id_salt("props").show(ui, |ui| {
-            egui::Grid::new("propgrid").num_columns(3).striped(true).show(ui, |ui| {
-                for (k, p) in c.props.iter().enumerate() {
-                    let pname = library::prop_name(&c, k);
-                    let desc = info.and_then(|i| i.props.get(k)).map(|p| p.description.clone()).unwrap_or_default();
-                    ui.label(&pname).on_hover_text(&desc);
-                    if k >= self.prop_buf.len() {
-                        self.prop_buf.push(p.value.clone());
-                    }
-                    // "[a, b, c]" in the description -> choice list (like Qucs-S' property dialog)
-                    let options: Vec<String> = desc
-                        .rsplit_once('[')
-                        .and_then(|(_, r)| r.split_once(']'))
-                        .map(|(o, _)| o.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
-                        .unwrap_or_default();
-                    if options.len() >= 2 && options.len() <= 30 {
-                        let mut v = p.value.clone();
-                        egui::ComboBox::from_id_salt(("prop", k)).width(130.0).selected_text(&v).show_ui(ui, |ui| {
-                            for o in &options {
-                                ui.selectable_value(&mut v, o.clone(), o);
+            // One row per property: name | value | "show" checkbox. The value field takes whatever width is left after
+            // the checkbox (right-to-left layout), so it follows the panel when it is dragged wider or narrower and can
+            // never push the panel open on its own.
+            let body = egui::TextStyle::Body.resolve(ui.style());
+            let label_w = (0..c.props.len())
+                .map(|k| ui.painter().layout_no_wrap(library::prop_name(&c, k), body.clone(), egui::Color32::PLACEHOLDER).size().x)
+                .fold(0.0_f32, f32::max);
+            let row_h = ui.spacing().interact_size.y;
+            for (k, p) in c.props.iter().enumerate() {
+                let pname = library::prop_name(&c, k);
+                let desc = info.and_then(|i| i.props.get(k)).map(|p| p.description.clone()).unwrap_or_default();
+                if k >= self.prop_buf.len() {
+                    self.prop_buf.push(p.value.clone());
+                }
+                // "[a, b, c]" in the description -> choice list (like Qucs-S' property dialog)
+                let options: Vec<String> = desc
+                    .rsplit_once('[')
+                    .and_then(|(_, r)| r.split_once(']'))
+                    .map(|(o, _)| o.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+                    .unwrap_or_default();
+                let fill = if k % 2 == 1 { ui.visuals().faint_bg_color } else { egui::Color32::TRANSPARENT };
+                egui::Frame::NONE.fill(fill).inner_margin(egui::Margin::symmetric(2, 2)).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.allocate_ui_with_layout(egui::vec2(label_w, row_h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            // pad every name to the longest one so all value fields start at the same x
+                            ui.set_min_width(label_w);
+                            ui.label(&pname).on_hover_text(&desc);
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let mut vis = p.visible();
+                            if ui.checkbox(&mut vis, "").on_hover_text("回路図に表示").changed() {
+                                toggle = Some(k);
+                            }
+                            let w = ui.available_width().max(40.0);
+                            if options.len() >= 2 && options.len() <= 30 {
+                                let mut v = p.value.clone();
+                                egui::ComboBox::from_id_salt(("prop", k)).width(w).selected_text(&v).show_ui(ui, |ui| {
+                                    for o in &options {
+                                        ui.selectable_value(&mut v, o.clone(), o);
+                                    }
+                                });
+                                if v != p.value {
+                                    self.prop_buf[k] = v.clone();
+                                    commit = Some((k, v));
+                                }
+                            } else {
+                                let r = ui.add_sized([w, row_h], egui::TextEdit::singleline(&mut self.prop_buf[k]));
+                                if r.lost_focus() && self.prop_buf[k] != p.value {
+                                    commit = Some((k, self.prop_buf[k].clone()));
+                                }
                             }
                         });
-                        if v != p.value {
-                            self.prop_buf[k] = v.clone();
-                            commit = Some((k, v));
-                        }
-                    } else {
-                        let r = ui.add(egui::TextEdit::singleline(&mut self.prop_buf[k]).desired_width(130.0));
-                        if r.lost_focus() && self.prop_buf[k] != p.value {
-                            commit = Some((k, self.prop_buf[k].clone()));
-                        }
-                    }
-                    let mut vis = p.visible();
-                    if ui.checkbox(&mut vis, "").on_hover_text("回路図に表示").changed() {
-                        toggle = Some(k);
-                    }
-                    ui.end_row();
-                }
-            });
+                    });
+                });
+            }
         });
         if let Some((k, v)) = commit {
             self.doc.checkpoint();
