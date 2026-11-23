@@ -526,9 +526,23 @@ pub fn canonical(p: &Path) -> Result<PathBuf, String> {
     })
 }
 
-/// `<dir>/<stem>_<suffix>` next to a schematic, plus the stem.
+/// Marks a temporary copy of an unsaved schematic (see `unsaved_copy_path`).
+const UNSAVED_TAG: &str = ".~unsaved-";
+
+/// `<dir>/<stem>.~unsaved-<kind>.sch`: where the editor writes the unsaved state of a
+/// schematic to simulate it without overwriting the file. It sits next to the original so
+/// that relative subcircuit / library references still resolve.
+pub fn unsaved_copy_path(sch_path: &Path, kind: &str) -> Result<PathBuf, String> {
+    let stem = sch_path.file_stem().map(|s| s.to_string_lossy().to_string()).ok_or_else(|| format!("{}: not a file name", sch_path.display()))?;
+    let dir = sch_path.parent().ok_or_else(|| format!("{}: no parent directory", sch_path.display()))?;
+    Ok(dir.join(format!("{stem}{UNSAVED_TAG}{kind}.sch")))
+}
+
+/// `<dir>/<stem>_<suffix>` next to a schematic, plus the stem. A temporary unsaved copy
+/// uses the work directory of its original.
 pub fn work_dir(sch_path: &Path, suffix: &str) -> Result<(PathBuf, String), String> {
     let stem = sch_path.file_stem().map(|s| s.to_string_lossy().to_string()).ok_or_else(|| format!("{}: not a file name", sch_path.display()))?;
+    let stem = stem.split(UNSAVED_TAG).next().unwrap_or_default().to_string();
     let dir = sch_path.parent().ok_or_else(|| format!("{}: no parent directory", sch_path.display()))?;
     Ok((dir.join(format!("{stem}_{suffix}")), stem))
 }

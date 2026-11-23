@@ -252,3 +252,12 @@ fn router_avoids_symbols_and_foreign_nets() {
         }
     }
 }
+
+#[test]
+fn unsaved_copy_shares_the_work_dir_of_its_original() {
+    let orig = std::path::Path::new("C:/x/amp.sch");
+    let tmp = crate::sim::unsaved_copy_path(orig, "sim").unwrap();
+    assert_eq!(tmp.parent(), orig.parent());
+    assert_ne!(tmp, orig);
+    assert_eq!(crate::sim::work_dir(&tmp, "sim").unwrap(), crate::sim::work_dir(orig, "sim").unwrap());
+}

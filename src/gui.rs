@@ -1122,19 +1122,39 @@ impl App {
         self.changed();
     }
 
-    fn run_sim(&mut self) {
-        let Some(p) = self.doc.path.clone() else {
-            self.status = "先に保存してください".into();
-            return;
-        };
-        if let Err(e) = self.doc.save() {
-            self.status = e;
-            return;
+    /// The file a simulation reads. With auto-save on it is the document itself (saved
+    /// first); otherwise unsaved edits go to a temporary copy next to it, so that trying
+    /// values never overwrites the .sch. Returns (file to simulate, copy to delete afterwards).
+    fn sim_source(&mut self, kind: &str) -> Result<(PathBuf, Option<PathBuf>), String> {
+        let p = self.doc.path.clone().ok_or_else(|| "先に保存してください".to_string())?;
+        if self.auto_save {
+            self.doc.save()?;
+            self.disk_mtime = mtime(&p);
+            return Ok((p, None));
         }
-        self.disk_mtime = mtime(&p);
+        if !self.doc.dirty {
+            return Ok((p, None));
+        }
+        let tmp = sim::unsaved_copy_path(&p, kind)?;
+        self.doc.sch.save(&tmp)?;
+        Ok((tmp.clone(), Some(tmp)))
+    }
+
+    fn run_sim(&mut self) {
+        let (p, tmp) = match self.sim_source("sim") {
+            Ok(x) => x,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            let _ = tx.send(sim::simulate(&p, 300));
+            let r = sim::simulate(&p, 300);
+            if let Some(t) = tmp {
+                let _ = std::fs::remove_file(t);
+            }
+            let _ = tx.send(r);
         });
         self.sim_rx = Some((self.tab_id, rx));
         self.status = "シミュレーション実行中…".into();
@@ -1186,18 +1206,20 @@ impl App {
     // ------------------------------------------------------------------ DC operating point
 
     fn run_op(&mut self) {
-        let Some(p) = self.doc.path.clone() else {
-            self.status = "先に保存してください".into();
-            return;
+        let (p, tmp) = match self.sim_source("op") {
+            Ok(x) => x,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
         };
-        if let Err(e) = self.doc.save() {
-            self.status = e;
-            return;
-        }
-        self.disk_mtime = mtime(&p);
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            let _ = tx.send(sim::operating_point(&p, 120));
+            let r = sim::operating_point(&p, 120);
+            if let Some(t) = tmp {
+                let _ = std::fs::remove_file(t);
+            }
+            let _ = tx.send(r);
         });
         self.op_rx = Some((self.tab_id, rx));
         self.status = "DC 動作点を計算中…".into();
@@ -1844,15 +1866,13 @@ impl App {
         });
         self.mc.open = open;
         if start {
-            let Some(p) = self.doc.path.clone() else {
-                self.mc.error = "先に保存してください".into();
-                return;
+            let (p, tmp) = match self.sim_source("mc") {
+                Ok(x) => x,
+                Err(e) => {
+                    self.mc.error = e;
+                    return;
+                }
             };
-            if let Err(e) = self.doc.save() {
-                self.mc.error = e;
-                return;
-            }
-            self.disk_mtime = mtime(&p);
             let m = &self.mc;
             let at: Vec<serde_json::Value> = m.at.split(',').filter_map(|x| crate::rftools::parse_value(x.trim())).map(|x| serde_json::json!(x)).collect();
             let args = serde_json::json!({
@@ -1871,6 +1891,9 @@ impl App {
                     let hist = first.and_then(|m| crate::montecarlo::histogram_svg(&res, &spec, m["vector"].as_str().unwrap_or(""), m["at"].as_f64())).and_then(|s| crate::render::svg_to_rgba(&s).ok());
                     (res.summary, ov, hist)
                 });
+                if let Some(t) = tmp {
+                    let _ = std::fs::remove_file(t);
+                }
                 let _ = tx.send(r);
             });
             self.mc.rx = Some(rx);

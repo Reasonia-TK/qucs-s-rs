@@ -28,7 +28,7 @@ impl Default for Settings {
             pin_names: false,
             show_issues: true,
             show_grid: true,
-            auto_save: true,
+            auto_save: false,
             auto_reroute: true,
             recent: vec![],
             left_panel: 230.0,
@@ -115,7 +115,7 @@ mod tests {
     fn missing_fields_take_defaults() {
         let s: Settings = serde_json::from_str(r#"{"show_grid": false}"#).unwrap();
         assert!(!s.show_grid);
-        assert!(s.auto_save);
+        assert!(!s.auto_save);
         assert_eq!(s.left_panel, 230.0);
     }
 
